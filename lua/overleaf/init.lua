@@ -55,6 +55,7 @@ function M.setup(opts)
     map('n', '<leader>oR', function() M.reply_comment() end, { desc = 'Overleaf: Reply to comment' })
     map('n', '<leader>ox', function() M.resolve_comment() end, { desc = 'Overleaf: Resolve/reopen comment' })
     map('n', '<leader>of', function() M.search() end, { desc = 'Overleaf: Find in project' })
+    map('n', '<leader>om', function() M.set_main_file() end, { desc = 'Overleaf: Set main document' })
   end
 end
 
