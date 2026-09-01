@@ -116,15 +116,27 @@ const handlers = {
     const parsed = JSON.parse(compileRes.body);
 
     // Download log if available
+    // Build output is served only by the CLSI node that produced it; without
+    // clsiserverid the request lands on another node and 404s.
+    const clsiQuery = parsed.clsiServerId ? `?clsiserverid=${encodeURIComponent(parsed.clsiServerId)}` : '';
+
     const logFile = (parsed.outputFiles || []).find(f => f.path === 'output.log');
     let log = '';
     if (logFile) {
-      const logUrl = `${BASE_URL}${logFile.url}`;
+      const logUrl = `${BASE_URL}${logFile.url}${clsiQuery}`;
       const logRes = await auth.httpGet(logUrl, cookie);
-      log = logRes.body;
+      if (logRes.status === 200) log = logRes.body;
+      else console.log(`Failed to fetch compile log: status ${logRes.status}`);
     }
 
-    return { status: parsed.status, outputFiles: parsed.outputFiles || [], log };
+    return {
+      status: parsed.status,
+      outputFiles: parsed.outputFiles || [],
+      log,
+      clsiServerId: parsed.clsiServerId || null,
+      compileGroup: parsed.compileGroup || null,
+      pdfDownloadDomain: parsed.pdfDownloadDomain || null,
+    };
   },
 
   async downloadUrl(params) {
@@ -138,8 +150,8 @@ const handlers = {
     fs.mkdirSync(dir, { recursive: true });
     const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || 'download'));
 
-    await new Promise((resolve, reject) => {
-      const parsed = new URL(url);
+    const fetchTo = (target, redirectsLeft) => new Promise((resolve, reject) => {
+      const parsed = new URL(target);
       const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
       httpModule.get({
         hostname: parsed.hostname,
@@ -147,12 +159,28 @@ const handlers = {
         path: parsed.pathname + parsed.search,
         headers: { 'Cookie': cookie },
       }, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          if (redirectsLeft <= 0) {
+            reject({ code: 'DOWNLOAD_FAILED', message: 'Too many redirects' });
+            return;
+          }
+          resolve(fetchTo(new URL(res.headers.location, target).href, redirectsLeft - 1));
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject({ code: 'DOWNLOAD_FAILED', message: `Download failed with status ${res.statusCode}` });
+          return;
+        }
         const ws = fs.createWriteStream(tmpPath);
         res.pipe(ws);
         ws.on('finish', () => { ws.close(); resolve(); });
         ws.on('error', reject);
       }).on('error', reject);
     });
+
+    await fetchTo(url, 5);
 
     return { path: tmpPath };
   },
