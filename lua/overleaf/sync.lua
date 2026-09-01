@@ -90,14 +90,27 @@ function M.write_doc(doc)
   -- Atomic write: temp file + rename to prevent partial reads from fs_event race
   local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
   local f = io.open(tmp_path, 'w')
+  local renamed = false
   if f then
     f:write(doc.content)
     f:close()
-    os.rename(tmp_path, path)
+    local ok, err = os.rename(tmp_path, path)
+    if ok then
+      renamed = true
+    else
+      config.log('warn', 'Atomic write failed for %s: %s', doc.path, tostring(err))
+      os.remove(tmp_path)
+    end
   end
 
   -- Clear writing flag after watcher event has passed
-  vim.defer_fn(function() M._writing[path] = nil end, 300)
+  vim.defer_fn(function()
+    M._writing[path] = nil
+    -- rename() replaces the inode, which leaves the fs_event watch bound to the
+    -- old one -- it stops firing and inbound external edits are silently lost.
+    -- Re-arm after the flag clears so the new watcher does not see our own write.
+    if renamed and M._watchers[path] then M.watch(doc) end
+  end, 300)
 end
 
 --- Schedule a debounced write to disk (call after content changes)
