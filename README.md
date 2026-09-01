@@ -4,6 +4,55 @@ Neovim plugin for real-time collaborative LaTeX editing on [Overleaf](https://ww
 
 Edit your Overleaf projects directly in Neovim with full real-time collaboration support via Operational Transformation (OT). Use your favorite Neovim plugins — treesitter, LSP, snippets, copilot, and more — while collaborating with others on Overleaf.
 
+---
+
+## About this fork
+
+This is a maintenance fork of [richwomanbtc/overleaf.nvim](https://github.com/richwomanbtc/overleaf.nvim)
+by Kenji Kubo, which has had no commits since March 2026 and several open issues
+with unmerged fixes. All credit for the plugin belongs upstream; this fork exists
+only to carry fixes that upstream has not merged. It remains MIT licensed under
+the original copyright.
+
+### Changes relative to upstream
+
+| Change | Why |
+|---|---|
+| Pin build-output downloads to the CLSI server | Overleaf serves `output.pdf` and `output.log` only from the CLSI node that produced them, selected by a `clsiserverid` query param. Without it both 404, so compiles produced a 0-byte PDF and no diagnostics — while still reporting success. Fixes [#24](https://github.com/richwomanbtc/overleaf.nvim/issues/24); equivalent to unmerged [#25](https://github.com/richwomanbtc/overleaf.nvim/pull/25). |
+| Non-blocking PDF open | The auto-detect path used `vim.fn.system()`, freezing Neovim for as long as the PDF viewer stayed open. Now uses `vim.ui.open()`, which detaches, disables the pipes, and returns immediately. |
+| `:Overleaf main` | Overleaf compiles whatever the project's server-side `rootDoc_id` points at, and the plugin had no way to change it — so the main document could only be set from the Overleaf web UI. Adds a picker and `<leader>om`. |
+
+### Using this fork
+
+```lua
+{
+  "EdgesFTW/overleaf.nvim",
+  config = function()
+    require("overleaf").setup({
+      -- see Authentication below
+    })
+  end,
+  build = "cd node && npm install",
+}
+```
+
+### Setting the main document
+
+`:Overleaf compile` builds the project's **main document**, which is a server-side
+project setting — not whichever file you have open. Change it with:
+
+```
+:Overleaf main                  -- picker; the current main is marked *
+:Overleaf main paper/main.tex   -- set directly (tab-completes)
+<leader>om                      -- open the picker
+```
+
+Note that a `rootDoc_id` in the compile request body is ignored by Overleaf, so
+this changes the project setting itself — the same thing the web UI's
+*Menu → Main document* does, and it affects collaborators too.
+
+---
+
 ## Features
 
 - **Real-time collaboration** — edits sync instantly with other Overleaf users via OT
