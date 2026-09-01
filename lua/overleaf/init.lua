@@ -34,6 +34,7 @@ M._state = {
   project_id = nil,
   project_data = nil,
   csrf_token = nil,
+  root_doc_id = nil, -- project's main document; Overleaf compiles this one
   documents = {}, -- doc_id -> Document
 }
 
@@ -175,6 +176,7 @@ function M._connect_project(cookie, project_id, project_name)
     M._state.project_id = project_id
     M._state.project_name = project_name
     M._state.project_data = result.project
+    M._state.root_doc_id = result.project and result.project.rootDoc_id or nil
 
     -- Parse project tree
     project.parse_project_tree(result.project)
@@ -205,6 +207,15 @@ function M._setup_event_handlers()
         buffer.apply_remote(doc, transformed_ops)
         sync.schedule_write(doc)
       end)
+    end
+  end)
+
+  -- The server pushes this when the main document is changed from any client.
+  bridge.on_event('rootDocUpdated', function(data)
+    if data and data.docId then
+      M._state.root_doc_id = data.docId
+      local entry = project.get_doc_by_id(data.docId)
+      config.log('info', 'Main document is now %s', entry and entry.path or data.docId)
     end
   end)
 
@@ -1012,6 +1023,63 @@ function M.compile()
     end
 
     vim.schedule(function() M._parse_compile_log(result.log or '') end)
+  end)
+end
+
+--- Set the project's main document (what :Overleaf compile builds).
+--- `name` optionally pre-selects by path; with no argument a picker is shown.
+function M.set_main_file(name)
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    return
+  end
+
+  local candidates = {}
+  for _, e in ipairs(project._project_tree) do
+    if e.type == 'doc' and e.path:match('%.tex$') then table.insert(candidates, e) end
+  end
+  if #candidates == 0 then
+    config.log('warn', 'No .tex documents in this project')
+    return
+  end
+
+  local function apply(entry)
+    if entry.id == M._state.root_doc_id then
+      config.log('info', '%s is already the main document', entry.path)
+      return
+    end
+    bridge.request('setRootDoc', {
+      cookie = config.get().cookie,
+      csrfToken = M._state.csrf_token,
+      projectId = M._state.project_id,
+      rootDocId = entry.id,
+    }, function(err)
+      if err then
+        config.log('error', 'Failed to set main document: %s', err.message)
+        return
+      end
+      M._state.root_doc_id = entry.id
+      config.log('info', 'Main document set to %s', entry.path)
+    end)
+  end
+
+  if name and name ~= '' then
+    local match = project.get_doc_by_path(name)
+    if not match then
+      config.log('error', 'No such document: %s', name)
+      return
+    end
+    apply(match)
+    return
+  end
+
+  vim.ui.select(candidates, {
+    prompt = 'Set main document (compiled by :Overleaf compile):',
+    format_item = function(item)
+      return (item.id == M._state.root_doc_id and '* ' or '  ') .. item.path
+    end,
+  }, function(choice)
+    if choice then apply(choice) end
   end)
 end
 

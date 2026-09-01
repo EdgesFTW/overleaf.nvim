@@ -229,6 +229,25 @@ const handlers = {
     return { path: tmpPath };
   },
 
+  // Change the project's main (root) document. Overleaf compiles whatever
+  // rootDoc_id points at; there is no per-compile override (a rootDoc_id in the
+  // compile body is ignored), so this project setting is the only lever.
+  async setRootDoc(params) {
+    const { cookie, csrfToken, projectId, rootDocId } = params;
+    if (!cookie || !csrfToken || !projectId || !rootDocId) {
+      throw { code: 'MISSING_PARAM', message: 'cookie, csrfToken, projectId, and rootDocId are required' };
+    }
+    const res = await auth.httpPost(
+      `${BASE_URL}/project/${projectId}/settings`,
+      cookie, csrfToken,
+      { rootDocId }
+    );
+    if (res.status !== 200 && res.status !== 204) {
+      throw { code: 'SET_ROOT_DOC_FAILED', message: `Setting main document failed: ${res.status} ${res.body}` };
+    }
+    return { rootDocId };
+  },
+
   async createDoc(params) {
     const { cookie, csrfToken, projectId, name, parentFolderId } = params;
     if (!cookie || !csrfToken || !projectId || !name) {

@@ -3,6 +3,7 @@ local subcommands = {
   connect = function() require('overleaf').connect() end,
   disconnect = function() require('overleaf').disconnect() end,
   compile = function() require('overleaf').compile() end,
+  main = function(args) require('overleaf').set_main_file(args) end,
   tree = function() require('overleaf').toggle_tree() end,
   open = function(args) require('overleaf').open_document(args) end,
   projects = function() require('overleaf').select_project() end,
@@ -74,6 +75,18 @@ end, {
     end
     -- Complete subcommand arguments
     local sub = parts[2]
+    if sub == 'main' then
+      local ok, project = pcall(require, 'overleaf.project')
+      if not ok then return {} end
+      local out = {}
+      for _, e in ipairs(project._project_tree) do
+        if e.type == 'doc' and e.path:match('%.tex$') and e.path:find(arglead or '', 1, true) == 1 then
+          table.insert(out, e.path)
+        end
+      end
+      table.sort(out)
+      return out
+    end
     if sub == 'comments' then return { 'refresh' } end
     if sub == 'sync' then return { 'import', 'export' } end
     return {}
