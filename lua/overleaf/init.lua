@@ -15,16 +15,16 @@ local function open_file(file_path)
     -- User-configured viewer: run as background job to avoid disrupting cursor/window layout
     vim.fn.jobstart({ viewer, file_path }, { detach = true })
   else
-    -- Auto-detect platform launcher (runs in background)
-    local cmd
-    if vim.fn.has('mac') == 1 then
-      cmd = { 'open', file_path }
-    elseif vim.fn.has('wsl') == 1 then
-      cmd = { 'wslview', file_path }
-    else
-      cmd = { 'xdg-open', file_path }
-    end
-    vim.fn.system(cmd)
+    -- vim.ui.open() spawns with detach=true and, for xdg-open, with the stdout
+    -- and stderr pipes disabled: the viewer is reparented to init (so it leaves
+    -- no zombie and outlives nvim) and no output is buffered for its lifetime.
+    -- It returns the process handle without waiting.
+    --
+    -- This previously used vim.fn.system(), which is synchronous and froze nvim
+    -- until the viewer exited. vim.ui.open also covers more platforms than the
+    -- mac/wsl/else detection it replaces.
+    local _, err = vim.ui.open(file_path)
+    if err then config.log('error', 'Could not open %s: %s', file_path, err) end
   end
 end
 
