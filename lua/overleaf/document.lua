@@ -198,6 +198,10 @@ function Document:check_content()
   if not self.joined or self._rejoining then return true end
   if not self.bufnr or not vim.api.nvim_buf_is_valid(self.bufnr) then return true end
   if self.applying_remote then return true end
+  -- A local edit that has not been reconciled into ops yet is a legitimate,
+  -- momentary difference -- not divergence. Checking here would rejoin on every
+  -- keystroke.
+  if require('overleaf.buffer').has_pending(self) then return true end
 
   local lines = vim.api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
   local buf_content = table.concat(lines, '\n')
