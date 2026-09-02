@@ -33,6 +33,56 @@ function sendEvent(event, data) {
   send({ event, data });
 }
 
+// Download `url` to `destPath`, following redirects and refusing anything that
+// is not a 200. Writing whatever the server returned -- an error page, or
+// nothing at all -- produces a file that looks fine to the caller and is
+// garbage to whatever opens it, which is how the 0-byte PDF bug worked.
+function fetchToFile(url, cookie, destPath, redirectsLeft = 5) {
+  const fs = require('fs');
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
+    httpModule.get({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
+      path: parsed.pathname + parsed.search,
+      headers: { 'Cookie': cookie },
+    }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) {
+          reject({ code: 'DOWNLOAD_FAILED', message: 'Too many redirects' });
+          return;
+        }
+        resolve(fetchToFile(new URL(res.headers.location, url).href, cookie, destPath, redirectsLeft - 1));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject({ code: 'DOWNLOAD_FAILED', message: `Download failed with status ${res.statusCode}` });
+        return;
+      }
+      // Written only for a confirmed 200, so a failure leaves no partial file.
+      const ws = fs.createWriteStream(destPath, { mode: 0o600 });
+      res.pipe(ws);
+      ws.on('finish', () => { ws.close(); resolve(); });
+      ws.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+// Downloads default to a private per-user directory rather than a shared
+// /tmp: the old path was world-readable and predictable, so on a multi-user
+// machine anyone could read a compiled paper, or pre-place a symlink there.
+function downloadDir(outputDir) {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const dir = outputDir || path.join(os.tmpdir(), `overleaf-nvim-${process.getuid ? process.getuid() : 'user'}`);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
 const handlers = {
   async ping(params) {
     return { status: 'ok' };
@@ -144,44 +194,9 @@ const handlers = {
     if (!cookie || !url) {
       throw { code: 'MISSING_PARAM', message: 'cookie and url are required' };
     }
-
-    const dir = outputDir || require('os').tmpdir();
-    const fs = require('fs');
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = downloadDir(outputDir);
     const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || 'download'));
-
-    const fetchTo = (target, redirectsLeft) => new Promise((resolve, reject) => {
-      const parsed = new URL(target);
-      const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
-      httpModule.get({
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-        path: parsed.pathname + parsed.search,
-        headers: { 'Cookie': cookie },
-      }, (res) => {
-        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-          res.resume();
-          if (redirectsLeft <= 0) {
-            reject({ code: 'DOWNLOAD_FAILED', message: 'Too many redirects' });
-            return;
-          }
-          resolve(fetchTo(new URL(res.headers.location, target).href, redirectsLeft - 1));
-          return;
-        }
-        if (res.statusCode !== 200) {
-          res.resume();
-          reject({ code: 'DOWNLOAD_FAILED', message: `Download failed with status ${res.statusCode}` });
-          return;
-        }
-        const ws = fs.createWriteStream(tmpPath);
-        res.pipe(ws);
-        ws.on('finish', () => { ws.close(); resolve(); });
-        ws.on('error', reject);
-      }).on('error', reject);
-    });
-
-    await fetchTo(url, 5);
-
+    await fetchToFile(url, cookie, tmpPath);
     return { path: tmpPath };
   },
 
@@ -190,62 +205,10 @@ const handlers = {
     if (!cookie || !projectId || !fileId) {
       throw { code: 'MISSING_PARAM', message: 'cookie, projectId, and fileId are required' };
     }
-
-    const url = `${BASE_URL}/project/${projectId}/file/${fileId}`;
-    const dir = outputDir || require('os').tmpdir();
-
-    // Download binary file
-    const fs = require('fs');
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = downloadDir(outputDir);
     const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || fileId));
-    await new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
-      httpModule.get({
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-        path: parsed.pathname,
-        headers: { 'Cookie': cookie },
-      }, (res) => {
-        if (res.statusCode === 302 && res.headers.location) {
-          // Follow redirect
-          const redirectParsed = new URL(res.headers.location);
-          const redirectModule = redirectParsed.protocol === 'http:' ? require('http') : require('https');
-          redirectModule.get(res.headers.location, { headers: { 'Cookie': cookie } }, (res2) => {
-            const ws = fs.createWriteStream(tmpPath);
-            res2.pipe(ws);
-            ws.on('finish', () => { ws.close(); resolve(); });
-            ws.on('error', reject);
-          }).on('error', reject);
-        } else {
-          const ws = fs.createWriteStream(tmpPath);
-          res.pipe(ws);
-          ws.on('finish', () => { ws.close(); resolve(); });
-          ws.on('error', reject);
-        }
-      }).on('error', reject);
-    });
-
+    await fetchToFile(`${BASE_URL}/project/${projectId}/file/${fileId}`, cookie, tmpPath);
     return { path: tmpPath };
-  },
-
-  // Change the project's main (root) document. Overleaf compiles whatever
-  // rootDoc_id points at; there is no per-compile override (a rootDoc_id in the
-  // compile body is ignored), so this project setting is the only lever.
-  async setRootDoc(params) {
-    const { cookie, csrfToken, projectId, rootDocId } = params;
-    if (!cookie || !csrfToken || !projectId || !rootDocId) {
-      throw { code: 'MISSING_PARAM', message: 'cookie, csrfToken, projectId, and rootDocId are required' };
-    }
-    const res = await auth.httpPost(
-      `${BASE_URL}/project/${projectId}/settings`,
-      cookie, csrfToken,
-      { rootDocId }
-    );
-    if (res.status !== 200 && res.status !== 204) {
-      throw { code: 'SET_ROOT_DOC_FAILED', message: `Setting main document failed: ${res.status} ${res.body}` };
-    }
-    return { rootDocId };
   },
 
   async createDoc(params) {
