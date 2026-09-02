@@ -251,9 +251,8 @@ function listProfilesIn(baseDir, browser) {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
 
-    // Chrome profiles are 'Default', 'Profile 1', 'Profile 2', etc.
-    if (entry.name !== 'Default' && !entry.name.startsWith('Profile ')) continue;
-
+    // Any directory with a Cookies db is a usable profile. Chrome's own are
+    // 'Default' / 'Profile N', but users can create arbitrarily named ones.
     const cookiesDb = path.join(baseDir, entry.name, 'Cookies');
     if (!fs.existsSync(cookiesDb)) continue;
 
@@ -340,33 +339,121 @@ function decryptCookieValue(encryptedValue, keyV10, keyV11) {
  * Extract Overleaf cookie from a specific Chrome profile.
  * @param {string} profileDir - Profile directory name (e.g. 'Default', 'Profile 1')
  */
-async function getOverleafCookie(profileDir, baseDirOverride) {
-  profileDir = profileDir || 'Default';
+// Chrome stores timestamps as microseconds since 1601-01-01 UTC.
+function chromeTimeToUnixMs(v) {
+  const n = Number(v);
+  if (!n) return 0;
+  return Math.round(n / 1000 - 11644473600000);
+}
 
-  // The requested profile name can exist under more than one install; try each
-  // until one actually holds an Overleaf cookie, rather than failing on the first.
+function cookieDomainForQuery() {
+  let cookieDomain = 'overleaf.com';
+  if (process.env.OVERLEAF_URL) {
+    try {
+      cookieDomain = new URL(process.env.OVERLEAF_URL).hostname;
+    } catch (e) { /* keep default */ }
+  }
+  return cookieDomain;
+}
+
+// Every overleaf_session2 row in one profile's cookie db, with its timestamps.
+function queryProfileCookies(cookiesDb) {
+  const tmpDb = path.join(os.tmpdir(), `overleaf_cookies_${process.pid}_${Math.abs(hashString(cookiesDb))}.db`);
+  try {
+    fs.copyFileSync(cookiesDb, tmpDb);
+  } catch (e) {
+    return [];
+  }
+  try {
+    const query =
+      `SELECT name, hex(encrypted_value), creation_utc, last_access_utc, expires_utc ` +
+      `FROM cookies WHERE host_key LIKE '%${cookieDomainForQuery()}' AND name = 'overleaf_session2';`;
+    const out = execSync(`sqlite3 "${tmpDb}" "${query}"`, { encoding: 'utf-8' }).trim();
+    if (!out) return [];
+    return out.split('\n').map((line) => {
+      const [name, hexValue, creation, lastAccess, expires] = line.split('|');
+      return {
+        name,
+        hexValue,
+        creation: chromeTimeToUnixMs(creation),
+        lastAccess: chromeTimeToUnixMs(lastAccess),
+        expires: chromeTimeToUnixMs(expires),
+      };
+    }).filter((r) => r.hexValue);
+  } catch (e) {
+    return [];
+  } finally {
+    try { fs.unlinkSync(tmpDb); } catch (e) { /* ignore */ }
+  }
+}
+
+function hashString(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  return h;
+}
+
+// Search every profile of every detected browser. Newest session first, so the
+// browser you logged into most recently wins when several profiles have one.
+function findOverleafCookies(profileFilter, baseDirOverride) {
   const bases = baseDirOverride
     ? [{ browser: 'explicit', baseDir: baseDirOverride }]
     : resolveChromeBaseDirs();
 
-  const candidates = bases
-    .map((b) => ({ ...b, cookiesDb: path.join(b.baseDir, profileDir, 'Cookies') }))
-    .filter((b) => fs.existsSync(b.cookiesDb));
-
-  if (candidates.length === 0) {
-    throw { code: 'NOT_FOUND', message: `Chrome Cookies database not found for profile: ${profileDir}` };
+  const found = [];
+  for (const { browser, baseDir } of bases) {
+    for (const profile of listProfilesIn(baseDir, browser)) {
+      if (profileFilter && profile.dir !== profileFilter) continue;
+      const cookiesDb = path.join(baseDir, profile.dir, 'Cookies');
+      for (const row of queryProfileCookies(cookiesDb)) {
+        found.push({ ...row, browser, baseDir, profile: profile.dir, label: profile.name });
+      }
+    }
   }
+
+  // Most recently used session first; fall back to creation, then expiry.
+  found.sort((a, b) =>
+    (b.lastAccess - a.lastAccess) || (b.creation - a.creation) || (b.expires - a.expires));
+  return found;
+}
+
+// profileDir is optional: with it, only that profile is searched; without it,
+// every profile of every detected browser is searched and the most recently
+// used Overleaf session wins.
+async function getOverleafCookie(profileDir, baseDirOverride) {
+  ensureSqlite3Available();
+
+  const candidates = findOverleafCookies(profileDir || null, baseDirOverride);
+  if (candidates.length === 0) {
+    throw {
+      code: 'NO_COOKIE',
+      message: profileDir
+        ? `No overleaf_session2 cookie in profile "${profileDir}". Log in to overleaf.com in that browser profile first.`
+        : 'No overleaf_session2 cookie found in any Chrome/Chromium profile. Log in to overleaf.com first.',
+    };
+  }
+
+  console.log(`Cookie search: ${candidates.length} candidate(s) across profiles`);
+
+  const { keyV10, keyV11 } = getEncryptionKeys();
 
   let lastErr = null;
   for (const c of candidates) {
     try {
-      return await extractFrom(c.cookiesDb);
+      const value = decryptCookieValue(Buffer.from(c.hexValue, 'hex'), keyV10, keyV11);
+      if (!value || !value.startsWith('s%3A')) {
+        throw { code: 'DECRYPT_FAILED', message: 'decrypted value is not a session cookie' };
+      }
+      const when = c.lastAccess ? new Date(c.lastAccess).toISOString() : 'unknown';
+      console.log(`Cookie source: ${c.browser} / ${c.profile} (last used ${when})`);
+      return `${c.name}=${value}`;
     } catch (e) {
       lastErr = e;
-      console.log(`Cookie lookup failed in ${c.baseDir}: ${e.message || e.code}`);
+      console.log(`Cookie candidate rejected (${c.browser} / ${c.profile}): ${e.message || e.code}`);
     }
   }
-  throw lastErr;
+
+  throw lastErr || { code: 'DECRYPT_FAILED', message: 'Failed to decrypt any Overleaf cookie.' };
 }
 
 async function extractFrom(cookiesDb) {
@@ -421,6 +508,8 @@ module.exports = {
   _internal: {
     resolveChromeBaseDir,
     resolveChromeBaseDirs,
+    findOverleafCookies,
+    chromeTimeToUnixMs,
     decryptCookieValue,
     normalizeV11Key,
     ensureSqlite3Available,
