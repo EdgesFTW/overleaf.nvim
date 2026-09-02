@@ -21,6 +21,9 @@ the original copyright.
 | Pin build-output downloads to the CLSI server | Overleaf serves `output.pdf` and `output.log` only from the CLSI node that produced them, selected by a `clsiserverid` query param. Without it both 404, so compiles produced a 0-byte PDF and no diagnostics — while still reporting success. Fixes [#24](https://github.com/richwomanbtc/overleaf.nvim/issues/24); equivalent to unmerged [#25](https://github.com/richwomanbtc/overleaf.nvim/pull/25). |
 | Non-blocking PDF open | The auto-detect path used `vim.fn.system()`, freezing Neovim for as long as the PDF viewer stayed open. Now uses `vim.ui.open()`, which detaches, disables the pipes, and returns immediately. |
 | `:Overleaf main` | Overleaf compiles whatever the project's server-side `rootDoc_id` points at, and the plugin had no way to change it — so the main document could only be set from the Overleaf web UI. Adds a picker and `<leader>om`. |
+| Browser cookie extraction on Linux | Upstream only supported macOS. Every profile of every detected Chrome/Chromium install is searched — including Flatpak and Snap — and the most recently used Overleaf session wins, so no cookie needs to be configured by hand. Builds on unmerged [#15](https://github.com/richwomanbtc/overleaf.nvim/pull/15). |
+| Sync race guards | Rejoin no longer wipes a populated buffer when the server returns empty, and disk writes are atomic. From unmerged [#22](https://github.com/richwomanbtc/overleaf.nvim/pull/22), plus a fix to re-arm the file watcher after the rename (`rename()` replaces the inode, which otherwise silently kills inbound sync). |
+| `env_file` accepts `~` and `$VAR` | `io.open` takes paths literally, so `~/.overleaf.env` was read as a directory named `~` and silently failed. Same intent as unmerged [#23](https://github.com/richwomanbtc/overleaf.nvim/pull/23). |
 
 ### Using this fork
 

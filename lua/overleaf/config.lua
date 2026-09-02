@@ -35,6 +35,12 @@ local function cookie_preview(cookie)
 end
 
 local function resolve_cookie_paths(env_file)
+  -- io.open() takes the path literally, so '~/x' would be read as a directory
+  -- named '~'. Normalize first, which expands both '~' and '$VAR'.
+  -- vim.fs.normalize is used rather than vim.fn.expand because it does not
+  -- glob -- a path containing '*' stays literal.
+  env_file = vim.fs.normalize(env_file)
+
   if env_file:sub(1, 1) == '/' then
     -- Absolute path: use directly
     return { env_file }
