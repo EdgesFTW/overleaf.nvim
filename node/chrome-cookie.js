@@ -13,7 +13,10 @@ const { execSync } = require('child_process');
 const CHROME_MAC_BASE_DIR = 'Library/Application Support/Google/Chrome';
 const CHROME_LINUX_PATHS = [
   { browser: 'chrome', path: '.config/google-chrome' },
+  { browser: 'chrome (flatpak)', path: '.var/app/com.google.Chrome/config/google-chrome' },
   { browser: 'chromium', path: '.config/chromium' },
+  { browser: 'chromium (flatpak)', path: '.var/app/org.chromium.Chromium/config/chromium' },
+  { browser: 'chromium (snap)', path: 'snap/chromium/common/chromium' },
 ];
 let secretToolMissingHintShown = false;
 
@@ -29,6 +32,32 @@ function trimTrailingNewlines(buffer) {
     end--;
   }
   return buffer.slice(0, end);
+}
+
+// Every Chrome/Chromium install present on this machine, in preference order.
+// A user can easily have several (e.g. native Chromium plus Flatpak Chrome),
+// and only one of them holds the Overleaf session -- so callers search all.
+function resolveChromeBaseDirs(options = {}) {
+  const platform = options.platform || os.platform();
+  const homeDir = options.homeDir || os.homedir();
+  const existsSync = options.existsSync || fs.existsSync;
+
+  if (platform === 'darwin') {
+    return [{ browser: 'chrome', baseDir: path.join(homeDir, CHROME_MAC_BASE_DIR) }];
+  }
+  if (platform !== 'linux') {
+    throw { code: 'UNSUPPORTED', message: 'Chrome cookie extraction only supported on macOS and Linux' };
+  }
+
+  const found = [];
+  for (const candidate of CHROME_LINUX_PATHS) {
+    const baseDir = path.join(homeDir, candidate.path);
+    if (existsSync(baseDir)) found.push({ browser: candidate.browser, baseDir });
+  }
+  if (found.length === 0) {
+    throw { code: 'NOT_FOUND', message: 'Chrome/Chromium data directory not found' };
+  }
+  return found;
 }
 
 function resolveChromeBaseDir(options = {}) {
@@ -206,10 +235,15 @@ function ensureSqlite3Available(options = {}) {
  * Returns array of { dir: 'Default', name: 'Person 1' }
  */
 function listProfiles() {
-  const { baseDir } = resolveChromeBaseDir();
-  if (!fs.existsSync(baseDir)) {
-    throw { code: 'NOT_FOUND', message: 'Chrome data directory not found' };
+  const profiles = [];
+  for (const { browser, baseDir } of resolveChromeBaseDirs()) {
+    for (const p of listProfilesIn(baseDir, browser)) profiles.push(p);
   }
+  return profiles;
+}
+
+function listProfilesIn(baseDir, browser) {
+  if (!fs.existsSync(baseDir)) return [];
 
   const profiles = [];
   const entries = fs.readdirSync(baseDir, { withFileTypes: true });
@@ -241,7 +275,13 @@ function listProfiles() {
       // Use directory name as fallback
     }
 
-    profiles.push({ dir: entry.name, name: displayName, email });
+    profiles.push({
+      dir: entry.name,
+      name: `${displayName} [${browser}]`,
+      email,
+      baseDir,
+      browser,
+    });
   }
 
   return profiles;
@@ -300,13 +340,36 @@ function decryptCookieValue(encryptedValue, keyV10, keyV11) {
  * Extract Overleaf cookie from a specific Chrome profile.
  * @param {string} profileDir - Profile directory name (e.g. 'Default', 'Profile 1')
  */
-async function getOverleafCookie(profileDir) {
+async function getOverleafCookie(profileDir, baseDirOverride) {
   profileDir = profileDir || 'Default';
-  const { baseDir } = resolveChromeBaseDir();
-  const cookiesDb = path.join(baseDir, profileDir, 'Cookies');
-  if (!fs.existsSync(cookiesDb)) {
+
+  // The requested profile name can exist under more than one install; try each
+  // until one actually holds an Overleaf cookie, rather than failing on the first.
+  const bases = baseDirOverride
+    ? [{ browser: 'explicit', baseDir: baseDirOverride }]
+    : resolveChromeBaseDirs();
+
+  const candidates = bases
+    .map((b) => ({ ...b, cookiesDb: path.join(b.baseDir, profileDir, 'Cookies') }))
+    .filter((b) => fs.existsSync(b.cookiesDb));
+
+  if (candidates.length === 0) {
     throw { code: 'NOT_FOUND', message: `Chrome Cookies database not found for profile: ${profileDir}` };
   }
+
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      return await extractFrom(c.cookiesDb);
+    } catch (e) {
+      lastErr = e;
+      console.log(`Cookie lookup failed in ${c.baseDir}: ${e.message || e.code}`);
+    }
+  }
+  throw lastErr;
+}
+
+async function extractFrom(cookiesDb) {
 
   ensureSqlite3Available();
 
@@ -357,6 +420,7 @@ module.exports = {
   listProfiles,
   _internal: {
     resolveChromeBaseDir,
+    resolveChromeBaseDirs,
     decryptCookieValue,
     normalizeV11Key,
     ensureSqlite3Available,
