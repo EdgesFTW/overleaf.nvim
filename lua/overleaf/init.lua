@@ -114,48 +114,18 @@ function M._get_cookie(callback)
     return
   end
 
-  -- Otherwise fall back to extracting from the browser.
-  config.log('info', 'Checking Chrome profiles...')
-  bridge.request('listChromeProfiles', {}, function(err, result)
-    if err or not result or not result.profiles or #result.profiles == 0 then
-      config.log('debug', 'Chrome profiles not available: %s', err and err.message or 'none found')
-      M._get_cookie_fallback(callback)
+  -- Otherwise search every profile of every detected browser. The bridge picks
+  -- the most recently used Overleaf session, so no profile prompt is needed.
+  config.log('info', 'Searching browser profiles for an Overleaf session...')
+  bridge.request('getCookie', {}, function(cookie_err, cookie_result)
+    if not cookie_err and cookie_result and cookie_result.cookie then
+      config.log('info', 'Cookie extracted from browser')
+      config.get().cookie = cookie_result.cookie
+      callback(cookie_result.cookie, 'chrome')
       return
     end
-
-    local profiles = result.profiles
-
-    local function extract_from_profile(profile_dir)
-      config.log('info', 'Extracting cookie from Chrome (%s)...', profile_dir)
-      bridge.request('getCookie', { profile = profile_dir }, function(cookie_err, cookie_result)
-        if not cookie_err and cookie_result and cookie_result.cookie then
-          config.log('info', 'Cookie extracted from Chrome')
-          config.get().cookie = cookie_result.cookie
-          config.log('debug', 'Cookie source: chrome')
-          callback(cookie_result.cookie, 'chrome')
-          return
-        end
-        config.log('debug', 'Chrome extraction failed: %s', cookie_err and cookie_err.message or 'unknown')
-        M._get_cookie_fallback(callback)
-      end)
-    end
-
-    if #profiles == 1 then
-      extract_from_profile(profiles[1].dir)
-    else
-      vim.schedule(function()
-        vim.ui.select(profiles, {
-          prompt = 'Select Chrome Profile:',
-          format_item = function(item) return item.name .. ' (' .. item.dir .. ')' end,
-        }, function(choice)
-          if choice then
-            extract_from_profile(choice.dir)
-          else
-            M._get_cookie_fallback(callback)
-          end
-        end)
-      end)
-    end
+    config.log('debug', 'Browser extraction failed: %s', cookie_err and cookie_err.message or 'unknown')
+    M._get_cookie_fallback(callback)
   end)
 end
 
