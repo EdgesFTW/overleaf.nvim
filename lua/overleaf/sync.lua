@@ -5,6 +5,11 @@ local bridge = require('overleaf.bridge')
 
 local M = {}
 
+-- Synced documents are unpublished work, so the mirror is created private to
+-- the user rather than inheriting a umask that usually yields world-readable
+-- directories. Existing directories are left alone.
+local SYNC_DIR_MODE = tonumber('700', 8)
+
 M._sync_dir = nil
 M._watchers = {} -- path -> {handle, doc_id}
 M._write_timers = {} -- doc_id -> timer
@@ -26,7 +31,7 @@ function M.start(project_name)
 
   -- Use project subdirectory
   M._sync_dir = sync_dir .. '/' .. project_name:gsub('[^%w%-_%.%s]', '_')
-  vim.fn.mkdir(M._sync_dir, 'p')
+  vim.fn.mkdir(M._sync_dir, 'p', SYNC_DIR_MODE)
 
   config.log('info', 'File sync: %s', M._sync_dir)
 end
@@ -87,7 +92,7 @@ function M.write_doc(doc)
 
   -- Ensure parent directory exists
   local dir = vim.fn.fnamemodify(path, ':h')
-  vim.fn.mkdir(dir, 'p')
+  vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
 
   -- Atomic write: temp file + rename to prevent partial reads from fs_event race
   local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
@@ -96,6 +101,8 @@ function M.write_doc(doc)
   if f then
     f:write(doc.content)
     f:close()
+    -- Match the directory: the mirrored document is private to the user.
+    pcall(vim.uv.fs_chmod, tmp_path, tonumber('600', 8))
     local ok, err = os.rename(tmp_path, path)
     if ok then
       renamed = true
@@ -317,7 +324,7 @@ function M.sync_all(state, project_tree, callback)
       table.insert(files, entry)
     elseif entry.type == 'folder' then
       -- Ensure folder exists on disk
-      vim.fn.mkdir(M._sync_dir .. '/' .. entry.path, 'p')
+      vim.fn.mkdir(M._sync_dir .. '/' .. entry.path, 'p', SYNC_DIR_MODE)
     end
   end
 
