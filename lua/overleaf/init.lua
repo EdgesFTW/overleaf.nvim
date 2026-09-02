@@ -103,7 +103,18 @@ function M.connect()
 end
 
 function M._get_cookie(callback)
-  -- Chrome first, then config/env as fallback
+  -- Explicit configuration wins. If the user set `cookie` or pointed `env_file`
+  -- at a readable file, use it and skip browser detection entirely -- otherwise
+  -- a machine with several Chrome/Chromium installs prompts with a profile
+  -- picker on every connect even though the cookie was already configured.
+  local configured = config.load_cookie()
+  if configured then
+    config.log('debug', 'Cookie source: config/env (skipping Chrome detection)')
+    callback(configured, 'env')
+    return
+  end
+
+  -- Otherwise fall back to extracting from the browser.
   config.log('info', 'Checking Chrome profiles...')
   bridge.request('listChromeProfiles', {}, function(err, result)
     if err or not result or not result.profiles or #result.profiles == 0 then
