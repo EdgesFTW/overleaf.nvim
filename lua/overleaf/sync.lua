@@ -8,7 +8,12 @@ local M = {}
 M._sync_dir = nil
 M._watchers = {} -- path -> {handle, doc_id}
 M._write_timers = {} -- doc_id -> timer
-M._writing = {} -- path -> true (suppress watcher during our writes)
+-- path -> the exact bytes we last wrote. A watcher event whose content matches
+-- this is our own write echoing back and is ignored. Identifying our writes by
+-- CONTENT rather than by a time window matters twice over: a slow write used to
+-- escape the window and be re-sent as an external change, and any genuine
+-- external edit that landed inside the window was dropped outright.
+M._last_written = {}
 
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
@@ -84,9 +89,6 @@ function M.write_doc(doc)
   local dir = vim.fn.fnamemodify(path, ':h')
   vim.fn.mkdir(dir, 'p')
 
-  -- Set writing flag to suppress watcher
-  M._writing[path] = true
-
   -- Atomic write: temp file + rename to prevent partial reads from fs_event race
   local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
   local f = io.open(tmp_path, 'w')
@@ -103,14 +105,12 @@ function M.write_doc(doc)
     end
   end
 
-  -- Clear writing flag after watcher event has passed
-  vim.defer_fn(function()
-    M._writing[path] = nil
-    -- rename() replaces the inode, which leaves the fs_event watch bound to the
-    -- old one -- it stops firing and inbound external edits are silently lost.
-    -- Re-arm after the flag clears so the new watcher does not see our own write.
-    if renamed and M._watchers[path] then M.watch(doc) end
-  end, 300)
+  if renamed then
+    M._last_written[path] = doc.content
+    -- rename() replaces the inode, leaving the fs_event watch bound to the old
+    -- one, where it stops firing and inbound external edits are silently lost.
+    if M._watchers[path] then M.watch(doc) end
+  end
 end
 
 --- Schedule a debounced write to disk (call after content changes)
@@ -149,8 +149,6 @@ function M.watch(doc)
 
   handle:start(path, {}, function(err, _, _)
     if err then return end
-    if M._writing[path] then return end
-
     vim.schedule(function() M._on_file_changed(path, doc) end)
   end)
 end
@@ -182,6 +180,11 @@ function M._on_file_changed(path, doc)
 
   -- No change
   if new_content == doc.content then return end
+
+  -- Our own write coming back. Compared against what we actually wrote, not a
+  -- timer, so it stays correct however long the write took and however much the
+  -- document has moved on since.
+  if new_content == M._last_written[path] then return end
 
   -- Guard: reject empty content when document has existing data.
   -- Prevents truncated file reads (race with external writes) from wiping the buffer.
