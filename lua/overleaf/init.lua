@@ -70,17 +70,24 @@ function M.connect()
     end
 
     -- Step 2: Get cookie (from config, .env, or Chrome)
-    M._get_cookie(function(cookie)
+    M._get_cookie(function(cookie, cookie_source)
       if not cookie then return end
 
       config.log('info', 'Authenticating...')
 
       -- Step 3: Authenticate and get project list
-      bridge.request('auth', { cookie = cookie }, function(auth_err, result)
+      bridge.request('auth', { cookie = cookie, cookieSource = cookie_source }, function(auth_err, result)
         if auth_err then
           config.log('error', 'Authentication failed: %s', auth_err.message)
           return
         end
+
+        local normalized_cookie = result.normalizedCookie or cookie
+        if result.cookieWasNormalized then
+          config.log('warn', 'Cookie value missing "overleaf_session2=" prefix, auto-prepending')
+        end
+        if result.cookieSource then config.log('debug', 'Cookie source: %s', result.cookieSource) end
+        config.get().cookie = normalized_cookie
 
         config.log('info', 'Authenticated as %s (%d projects)', result.userEmail or result.userId, #result.projects)
         M._state.csrf_token = result.csrfToken
@@ -88,7 +95,7 @@ function M.connect()
 
         -- Step 4: Select project
         project.select_project(
-          function(project_id, project_name) M._connect_project(cookie, project_id, project_name) end
+          function(project_id, project_name) M._connect_project(normalized_cookie, project_id, project_name) end
         )
       end)
     end)
@@ -96,58 +103,48 @@ function M.connect()
 end
 
 function M._get_cookie(callback)
-  -- Chrome first, then config/env as fallback
-  config.log('info', 'Checking Chrome profiles...')
-  bridge.request('listChromeProfiles', {}, function(err, result)
-    if err or not result or not result.profiles or #result.profiles == 0 then
-      config.log('debug', 'Chrome profiles not available: %s', err and err.message or 'none found')
-      M._get_cookie_fallback(callback)
+  -- Explicit configuration wins. If the user set `cookie` or pointed `env_file`
+  -- at a readable file, use it and skip browser detection entirely -- otherwise
+  -- a machine with several Chrome/Chromium installs prompts with a profile
+  -- picker on every connect even though the cookie was already configured.
+  local configured = config.load_cookie()
+  if configured then
+    config.log('debug', 'Cookie source: config/env (skipping Chrome detection)')
+    callback(configured, 'env')
+    return
+  end
+
+  -- Otherwise search every profile of every detected browser. The bridge picks
+  -- the most recently used Overleaf session, so no profile prompt is needed.
+  config.log('info', 'Searching browser profiles for an Overleaf session...')
+  bridge.request('getCookie', {}, function(cookie_err, cookie_result)
+    if not cookie_err and cookie_result and cookie_result.cookie then
+      config.log('info', 'Cookie extracted from browser')
+      config.get().cookie = cookie_result.cookie
+      callback(cookie_result.cookie, 'chrome')
       return
     end
-
-    local profiles = result.profiles
-
-    local function extract_from_profile(profile_dir)
-      config.log('info', 'Extracting cookie from Chrome (%s)...', profile_dir)
-      bridge.request('getCookie', { profile = profile_dir }, function(cookie_err, cookie_result)
-        if not cookie_err and cookie_result and cookie_result.cookie then
-          config.log('info', 'Cookie extracted from Chrome')
-          config.get().cookie = cookie_result.cookie
-          callback(cookie_result.cookie)
-          return
-        end
-        config.log('debug', 'Chrome extraction failed: %s', cookie_err and cookie_err.message or 'unknown')
-        M._get_cookie_fallback(callback)
-      end)
-    end
-
-    if #profiles == 1 then
-      extract_from_profile(profiles[1].dir)
-    else
-      vim.schedule(function()
-        vim.ui.select(profiles, {
-          prompt = 'Select Chrome Profile:',
-          format_item = function(item) return item.name .. ' (' .. item.dir .. ')' end,
-        }, function(choice)
-          if choice then
-            extract_from_profile(choice.dir)
-          else
-            M._get_cookie_fallback(callback)
-          end
-        end)
-      end)
-    end
+    config.log('debug', 'Browser extraction failed: %s', cookie_err and cookie_err.message or 'unknown')
+    M._get_cookie_fallback(callback)
   end)
 end
 
 function M._get_cookie_fallback(callback)
-  local cookie = config.load_cookie()
+  local cookie, meta = config.load_cookie({ return_metadata = true })
+  if meta and meta.checks then
+    for _, check in ipairs(meta.checks) do
+      config.log('debug', '.env path checked: %s (found: %s)', check.path, check.found and 'yes' or 'no')
+    end
+  end
+
   if cookie then
-    callback(cookie)
+    local source = meta and meta.source or 'config'
+    config.log('debug', 'Cookie source: %s', source)
+    callback(cookie, source)
     return
   end
   config.log('error', 'No cookie found. Log in to overleaf.com in Chrome, or set OVERLEAF_COOKIE in .env')
-  callback(nil)
+  callback(nil, nil)
 end
 
 function M._connect_project(cookie, project_id, project_name)
