@@ -20,6 +20,16 @@ M._write_timers = {} -- doc_id -> timer
 -- external edit that landed inside the window was dropped outright.
 M._last_written = {}
 
+-- Text fileRefs mirrored on disk. Overleaf stores anything whose extension is
+-- off its text whitelist (.asm, .c, ...) as an opaque "file" with no OT
+-- document behind it, so these cannot go through the doc path above: the only
+-- way to change one is to re-upload it whole, which Overleaf treats as a
+-- replace (same folder, same name, new entity id).
+M._files = {} -- doc path -> { entry = tree entry, content = last known bytes }
+M._file_watchers = {} -- disk path -> fs_event handle
+M._file_timers = {} -- disk path -> debounce timer
+M._last_uploaded = {} -- disk path -> the exact bytes last sent to Overleaf
+
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
 function M.start(project_name)
@@ -51,8 +61,22 @@ function M.stop()
   end
   M._write_timers = {}
 
+  for path in pairs(M._file_watchers) do
+    M._stop_file_watcher(path)
+  end
+  for _, timer in pairs(M._file_timers) do
+    vim.fn.timer_stop(timer)
+  end
+  M._file_timers = {}
+  M._files = {}
+  M._last_uploaded = {}
+
   M._sync_dir = nil
 end
+
+--- Whether a sync directory is active for the current project
+---@return boolean
+function M.active() return M._sync_dir ~= nil end
 
 --- Get the local file path for a document
 ---@param doc_path string Overleaf document path
@@ -201,6 +225,11 @@ function M._on_file_changed(path, doc)
   end
 
   config.log('info', 'External change: %s', doc.path)
+  -- The disk now holds this content and the doc is about to match it. Record
+  -- it as the in-sync state, otherwise a later edit that restores the bytes we
+  -- last wrote ourselves (an undo, a revert) would look like our own echo and
+  -- be dropped.
+  M._last_written[path] = new_content
 
   if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
     -- Doc is open in Neovim: replace buffer content (triggers on_bytes → OT → server)
@@ -258,19 +287,134 @@ function M._sync_closed_doc(doc, new_content)
   end)
 end
 
---- Download a binary file (image, etc.) to the sync directory
----@param entry table project tree entry {id, name, path, type='file'}
+-- ── FileRefs ─────────────────────────────────────────────────────────────
+
+-- Overleaf's doc/file split is decided by extension at upload time, so a
+-- fileRef with one of these extensions is never text and is not worth
+-- downloading again on every connect just to find that out.
+local BINARY_EXTENSIONS = {}
+for ext in
+  (
+    'png jpg jpeg gif bmp tif tiff webp ico heic pdf eps ps ai zip gz tgz bz2 xz tar 7z rar '
+    .. 'ttf otf woff woff2 pfb pfm mp3 mp4 wav ogg mov avi mkv xls xlsx doc docx ppt pptx '
+    .. 'jar exe dll so o a bin pyc class'
+  ):gmatch('%S+')
+do
+  BINARY_EXTENSIONS[ext] = true
+end
+
+-- Overleaf refuses docs above 2MB, so a text fileRef larger than this could
+-- never be a doc either and is not worth scanning.
+local MAX_TEXT_FILE_SIZE = 2 * 1024 * 1024
+
+local function is_valid_utf8(s)
+  local byte = string.byte
+  local i, n = 1, #s
+  while i <= n do
+    local c = byte(s, i)
+    if c < 0x80 then
+      i = i + 1
+    else
+      local len, min
+      if c >= 0xC2 and c <= 0xDF then
+        len, min = 2, 0x80
+      elseif c >= 0xE0 and c <= 0xEF then
+        len, min = 3, 0x800
+      elseif c >= 0xF0 and c <= 0xF4 then
+        len, min = 4, 0x10000
+      else
+        return false -- stray continuation byte, overlong lead, or > U+10FFFF
+      end
+      if i + len - 1 > n then return false end
+      local cp = c % (2 ^ (7 - len))
+      for k = 1, len - 1 do
+        local cc = byte(s, i + k)
+        if cc < 0x80 or cc > 0xBF then return false end
+        cp = cp * 64 + (cc - 0x80)
+      end
+      if cp < min or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then return false end
+      i = i + len
+    end
+  end
+  return true
+end
+
+--- Whether a byte string is text by Overleaf's own definition: valid UTF-8
+--- with no NUL bytes. This is the check Overleaf applies at upload time, so a
+--- fileRef passing it would have been a doc had its extension been whitelisted.
+---@param data string|nil
+---@return boolean
+function M.is_text(data)
+  if type(data) ~= 'string' then return false end
+  if #data > MAX_TEXT_FILE_SIZE then return false end
+  if data:find('\0', 1, true) then return false end
+  return is_valid_utf8(data)
+end
+
+--- Whether a fileRef may be opened as text, per the `editable_files` setting.
+---@param entry table tree entry {name, ...}
+---@return boolean|nil false = never; nil = decide from the content
+function M.file_policy(entry)
+  local mode = config.get().editable_files
+  if mode == false or mode == nil then return false end
+  local ext = (entry.name:match('%.([^%.]+)$') or ''):lower()
+  if type(mode) == 'table' then
+    for _, allowed in ipairs(mode) do
+      if tostring(allowed):lower():gsub('^%.', '') == ext then return nil end
+    end
+    return false
+  end
+  if BINARY_EXTENSIONS[ext] then return false end
+  return nil
+end
+
+local function read_bytes(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local data = f:read('*a')
+  f:close()
+  return data
+end
+
+-- Atomic private write, as write_doc does for docs. Returns true on success.
+local function write_bytes(path, data)
+  local dir = vim.fn.fnamemodify(path, ':h')
+  vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
+  local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
+  local f = io.open(tmp_path, 'wb')
+  if not f then return false end
+  f:write(data)
+  f:close()
+  pcall(vim.uv.fs_chmod, tmp_path, tonumber('600', 8))
+  local ok, err = os.rename(tmp_path, path)
+  if not ok then
+    config.log('warn', 'Atomic write failed for %s: %s', path, tostring(err))
+    os.remove(tmp_path)
+    return false
+  end
+  return true
+end
+
+--- Download a fileRef, classify it, and mirror it to the sync directory.
+--- Text fileRefs are always re-fetched so the mirror stays current (the
+--- server copy wins, as it does for docs in sync_all) and are then watched
+--- for edits; binaries are fetched once. Sets entry.text.
+---@param entry table tree entry {id, name, path, type='file'}
 ---@param project_id string
-function M._download_file(entry, project_id)
-  if not M._sync_dir then return end
+---@param callback function|nil called with (err, local_path)
+function M.fetch_file(entry, project_id, callback)
+  callback = callback or function() end
+  local policy = M.file_policy(entry)
+  local dest = M._sync_dir and (M._sync_dir .. '/' .. entry.path) or nil
 
-  local dest = M._sync_dir .. '/' .. entry.path
-
-  -- Skip if file already exists on disk (binary files don't change often)
-  if vim.fn.filereadable(dest) == 1 then return end
-
-  local dir = vim.fn.fnamemodify(dest, ':h')
-  vim.fn.mkdir(dir, 'p')
+  if policy == false then
+    entry.text = false
+    -- Known binary already on disk: nothing to refresh (images don't change often)
+    if dest and vim.fn.filereadable(dest) == 1 then
+      callback(nil, dest)
+      return
+    end
+  end
 
   bridge.request('downloadFile', {
     cookie = config.get().cookie,
@@ -280,28 +424,208 @@ function M._download_file(entry, project_id)
   }, function(err, result)
     if err then
       config.log('debug', 'Download skip %s: %s', entry.path, err.message)
+      callback(err)
       return
     end
 
-    -- Copy from temp to sync dir
-    local src = result.path
-    local ok, copy_err = pcall(function()
-      local src_f = io.open(src, 'rb')
-      if not src_f then error('Cannot read ' .. src) end
-      local data = src_f:read('*a')
-      src_f:close()
-
-      local dest_f = io.open(dest, 'wb')
-      if not dest_f then error('Cannot write ' .. dest) end
-      dest_f:write(data)
-      dest_f:close()
-    end)
-
-    if ok then
-      config.log('debug', 'Downloaded: %s', entry.path)
-    else
-      config.log('debug', 'Copy failed %s: %s', entry.path, tostring(copy_err))
+    local data = read_bytes(result.path)
+    if not data then
+      callback({ code = 'READ_FAILED', message = 'Cannot read ' .. tostring(result.path) })
+      return
     end
+
+    entry.text = (policy == nil) and M.is_text(data) or false
+
+    if not dest then
+      -- No sync directory: the caller works with the temp download directly
+      callback(nil, result.path)
+      return
+    end
+
+    local on_disk = read_bytes(dest)
+    if entry.text then
+      -- _last_written holds what we believe is on disk (our mirror writes and
+      -- confirmed uploads); anything else there is an edit nobody has synced.
+      if on_disk and on_disk ~= data and on_disk ~= M._last_written[dest] then
+        config.log(
+          'warn',
+          'Local copy of %s had unsynced changes and was replaced by the server copy '
+            .. '(edits made while not connected are not synced)',
+          entry.path
+        )
+      end
+      M._files[entry.path] = { entry = entry, content = data }
+    end
+
+    -- Leave an identical file untouched so an open buffer does not see a
+    -- spurious "changed on disk" for its own content.
+    if on_disk ~= data then
+      if not write_bytes(dest, data) then
+        callback({ code = 'WRITE_FAILED', message = 'Cannot write ' .. dest })
+        return
+      end
+      M._last_written[dest] = data
+    end
+
+    if entry.text then M.watch_file(entry) end
+    config.log('debug', 'Downloaded: %s (%s)', entry.path, entry.text and 'text' or 'binary')
+    callback(nil, dest)
+  end)
+end
+
+function M._stop_file_watcher(path)
+  local handle = M._file_watchers[path]
+  if handle then
+    if not handle:is_closing() then
+      handle:stop()
+      handle:close()
+    end
+    M._file_watchers[path] = nil
+  end
+end
+
+--- Watch a mirrored text fileRef and re-upload it when it changes on disk.
+---@param entry table tree entry
+function M.watch_file(entry)
+  if not M._sync_dir then return end
+  local path = M._sync_dir .. '/' .. entry.path
+  M._stop_file_watcher(path)
+
+  local handle = vim.uv.new_fs_event()
+  if not handle then return end
+  M._file_watchers[path] = handle
+
+  local ok = handle:start(path, {}, function(err)
+    if err then return end
+    vim.schedule(function()
+      -- Re-arm on every event: an editor that saves via temp-file-and-rename
+      -- replaces the inode, and a watch bound to the old one goes silent.
+      if M._file_watchers[path] == handle then M.watch_file(entry) end
+      M._on_file_ref_changed(path, entry)
+    end)
+  end)
+  if not ok then
+    -- The file may be missing for an instant mid-rename; try once more shortly.
+    M._stop_file_watcher(path)
+    vim.defer_fn(function()
+      if M._files[entry.path] and not M._file_watchers[path] then M.watch_file(entry) end
+    end, 200)
+  end
+end
+
+--- Stop tracking a fileRef (deleted on Overleaf, or sync stopping).
+--- The mirrored file is left on disk, as it is for docs.
+---@param entry table tree entry
+function M.forget_file(entry)
+  if not M._sync_dir then return end
+  local path = M._sync_dir .. '/' .. entry.path
+  M._stop_file_watcher(path)
+  if M._file_timers[path] then
+    vim.fn.timer_stop(M._file_timers[path])
+    M._file_timers[path] = nil
+  end
+  M._files[entry.path] = nil
+  M._last_uploaded[path] = nil
+end
+
+--- Follow a rename of a mirrored fileRef: move the disk copy and the watcher.
+---@param old_path string previous Overleaf path
+---@param entry table tree entry, already carrying the new path
+function M.rename_file(old_path, entry)
+  if not M._sync_dir then return end
+  local state = M._files[old_path]
+  if not state then return end
+  local from = M._sync_dir .. '/' .. old_path
+  local to = M._sync_dir .. '/' .. entry.path
+  M._stop_file_watcher(from)
+  M._files[old_path] = nil
+  vim.fn.mkdir(vim.fn.fnamemodify(to, ':h'), 'p', SYNC_DIR_MODE)
+  if os.rename(from, to) then
+    M._last_written[to], M._last_written[from] = M._last_written[from], nil
+    M._last_uploaded[to], M._last_uploaded[from] = M._last_uploaded[from], nil
+  end
+  state.entry = entry
+  M._files[entry.path] = state
+  M.watch_file(entry)
+end
+
+--- Handle a change to a mirrored fileRef (debounced: editors write in bursts)
+---@param path string disk path
+---@param entry table tree entry
+function M._on_file_ref_changed(path, entry)
+  if M._file_timers[path] then vim.fn.timer_stop(M._file_timers[path]) end
+  M._file_timers[path] = vim.fn.timer_start(500, function()
+    M._file_timers[path] = nil
+    if not M._files[entry.path] then return end -- forgotten meanwhile
+
+    local data = read_bytes(path)
+    if not data then return end
+
+    local known = M._files[entry.path]
+    if data == M._last_written[path] then return end -- our own mirror write
+    if data == M._last_uploaded[path] then return end -- already on Overleaf
+    if known and data == known.content then return end
+
+    -- Same guard as docs: a truncated read mid-write must not wipe the file
+    if #data == 0 and known and known.content and #known.content > 0 then
+      config.log('debug', 'Ignoring empty file read for %s', entry.path)
+      return
+    end
+
+    config.log('info', 'External change: %s', entry.path)
+    M.upload_file(entry, path, data)
+  end)
+end
+
+--- Replace a fileRef on Overleaf with the given local file.
+--- Uploading over an existing name in the same folder replaces it; Overleaf
+--- answers with the replacement's new entity id, which the tree entry takes on.
+---@param entry table tree entry
+---@param local_path string file to send
+---@param data string|nil the bytes at local_path, if already read
+---@param callback function|nil called with (err, result)
+function M.upload_file(entry, local_path, data, callback)
+  callback = callback or function() end
+  local ol = require('overleaf')
+  local project = require('overleaf.project')
+  local state = ol._state
+  if not state.connected then
+    config.log('warn', 'Not connected; %s not uploaded', entry.path)
+    callback({ code = 'NOT_CONNECTED', message = 'Not connected' })
+    return
+  end
+
+  data = data or read_bytes(local_path)
+  config.log('info', 'Uploading %s...', entry.path)
+  bridge.request('uploadFile', {
+    cookie = config.get().cookie,
+    csrfToken = state.csrf_token,
+    projectId = state.project_id,
+    filePath = local_path,
+    fileName = entry.name,
+    parentFolderId = project.get_parent_folder_id(entry),
+  }, function(err, result)
+    if err then
+      config.log('error', 'Upload failed for %s: %s', entry.path, err.message)
+      callback(err)
+      return
+    end
+    if data then
+      -- Disk and server now agree on these bytes (see _on_file_changed)
+      M._last_uploaded[local_path] = data
+      M._last_written[local_path] = data
+      local known = M._files[entry.path]
+      if known then known.content = data end
+    end
+    local new_id = result and result.entity_id
+    if new_id and new_id ~= entry.id then
+      config.log('debug', 'Replaced %s: %s -> %s', entry.path, entry.id, new_id)
+      -- The entry may already carry the new id if the socket event beat us
+      project.update_entry_id(entry.id, new_id)
+      entry.id = new_id
+    end
+    config.log('info', 'Uploaded %s (replaced on Overleaf)', entry.path)
+    callback(nil, result)
   end)
 end
 
@@ -328,12 +652,12 @@ function M.sync_all(state, project_tree, callback)
     end
   end
 
-  -- Download binary files (async, fire-and-forget)
+  -- Fetch fileRefs (async, fire-and-forget): binaries once, text ones every time
   local project_id = state.project_id
   if project_id and #files > 0 then
-    config.log('info', 'Downloading %d binary file(s)...', #files)
+    config.log('info', 'Downloading %d file(s)...', #files)
     for _, entry in ipairs(files) do
-      M._download_file(entry, project_id)
+      M.fetch_file(entry, project_id)
     end
   end
 
@@ -431,6 +755,15 @@ function M.import_all(state)
     end
   end
 
+  for doc_path, known in pairs(M._files) do
+    local path = M._sync_dir .. '/' .. doc_path
+    local disk_content = read_bytes(path)
+    if disk_content and disk_content ~= known.content then
+      changed = changed + 1
+      M.upload_file(known.entry, path, disk_content)
+    end
+  end
+
   if changed == 0 then
     config.log('info', 'No external changes detected')
   else
@@ -452,6 +785,15 @@ function M.export_all(state)
       M.write_doc(doc)
       count = count + 1
     end
+  end
+
+  for doc_path, known in pairs(M._files) do
+    local path = M._sync_dir .. '/' .. doc_path
+    if read_bytes(path) ~= known.content and write_bytes(path, known.content) then
+      M._last_written[path] = known.content
+      M.watch_file(known.entry)
+    end
+    count = count + 1
   end
 
   config.log('info', 'Exported %d document(s) to %s', count, M._sync_dir)

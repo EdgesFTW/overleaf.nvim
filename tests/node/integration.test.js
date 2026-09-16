@@ -14,7 +14,11 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
-const { createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore } = require('./mock-server');
+const fs = require('fs');
+const os = require('os');
+const {
+  createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore, createFile, getFiles,
+} = require('./mock-server');
 
 // ── Test framework ─────────────────────────────────────────────────────
 let passed = 0;
@@ -689,6 +693,75 @@ async function runTests() {
     const evt = bridge.events.find(e => e.event === 'rootDocUpdated');
     assert(evt, 'should receive rootDocUpdated event');
     assertEqual(evt.data.docId, 'new_root_doc_id', 'new root doc id');
+  });
+
+  // ── Test Suite: FileRefs (files Overleaf stores as binary) ──────
+  console.log('\nFileRefs:');
+
+  await test('downloadFile fetches a fileRef from the filestore', async () => {
+    createFile('main.asm', 'root_folder', 'mov eax, 1\n', 'file_asm');
+    const r = await bridge.request('downloadFile', {
+      cookie: 'overleaf_session2=x', projectId: 'test_project', fileId: 'file_asm', fileName: 'main.asm',
+    });
+    assertEqual(fs.readFileSync(r.path, 'utf8'), 'mov eax, 1\n', 'downloaded content');
+  });
+
+  await test('downloadFile of a missing fileRef fails cleanly', async () => {
+    let err;
+    try {
+      await bridge.request('downloadFile', {
+        cookie: 'overleaf_session2=x', projectId: 'test_project', fileId: 'nope', fileName: 'nope.asm',
+      });
+    } catch (e) {
+      err = e;
+    }
+    assert(err, 'request rejected');
+    assertEqual(err.code, 'DOWNLOAD_FAILED', 'error code');
+  });
+
+  await test('uploadFile over an existing name replaces the fileRef under a new id', async () => {
+    bridge.clearEvents();
+    const tmp = path.join(os.tmpdir(), `overleaf-nvim-test-${process.pid}-main.asm`);
+    fs.writeFileSync(tmp, 'mov eax, 2\n');
+    const r = await bridge.request('uploadFile', {
+      cookie: 'overleaf_session2=x', csrfToken: 'csrf', projectId: 'test_project',
+      filePath: tmp, fileName: 'main.asm', parentFolderId: 'root_folder',
+    });
+    fs.unlinkSync(tmp);
+    assert(r.success, 'upload succeeded');
+    assertEqual(r.entity_type, 'file', 'entity type');
+    assert(r.entity_id && r.entity_id !== 'file_asm', 'replacement has a new id');
+
+    const store = getFiles();
+    assert(!store['file_asm'], 'old fileRef is gone');
+    assertEqual(store[r.entity_id].content.toString(), 'mov eax, 2\n', 'stored content');
+    assertEqual(store[r.entity_id].folderId, 'root_folder', 'stored in the folder');
+
+    const evt = await bridge.waitForEvent('reciveNewFile');
+    assertEqual(evt.data.file._id, r.entity_id, 'event carries the new id');
+    assertEqual(evt.data.file.name, 'main.asm', 'event carries the name');
+    assertEqual(evt.data.parentFolderId, 'root_folder', 'event carries the folder');
+
+    const d = await bridge.request('downloadFile', {
+      cookie: 'overleaf_session2=x', projectId: 'test_project', fileId: r.entity_id, fileName: 'main.asm',
+    });
+    assertEqual(fs.readFileSync(d.path, 'utf8'), 'mov eax, 2\n', 'download after replace');
+  });
+
+  await test('uploadFile with a new name creates a fileRef without disturbing others', async () => {
+    bridge.clearEvents();
+    const before = Object.keys(getFiles()).length;
+    const tmp = path.join(os.tmpdir(), `overleaf-nvim-test-${process.pid}-other.asm`);
+    fs.writeFileSync(tmp, 'ret\n');
+    const r = await bridge.request('uploadFile', {
+      cookie: 'overleaf_session2=x', csrfToken: 'csrf', projectId: 'test_project',
+      filePath: tmp, fileName: 'other.asm', parentFolderId: 'root_folder',
+    });
+    fs.unlinkSync(tmp);
+    assert(r.success, 'upload succeeded');
+    assertEqual(Object.keys(getFiles()).length, before + 1, 'one more fileRef');
+    const evt = await bridge.waitForEvent('reciveNewFile');
+    assertEqual(evt.data.file.name, 'other.asm', 'event for the new file');
   });
 
   // ── Test Suite: Comment Events ─────────────────────────────────

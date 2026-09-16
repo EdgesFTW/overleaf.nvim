@@ -8,6 +8,13 @@ M._config = {
   pdf_viewer = nil, -- PDF viewer command (nil = auto-detect: 'open' on macOS, 'xdg-open' on Linux)
   pdf_dir = nil, -- PDF output directory (nil = a private per-user dir under the system temp dir)
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
+  -- Files Overleaf stores as binary "fileRefs" (anything whose extension is
+  -- not on its text whitelist, e.g. .asm or .c) have no real-time document
+  -- behind them, so they can only be edited by re-uploading the whole file.
+  --   'auto'  - open any fileRef whose content is text (UTF-8, no NUL bytes)
+  --   { 'asm', 'c' } - only fileRefs with these extensions (content still checked)
+  --   false   - never; fileRefs are download-only, as before
+  editable_files = 'auto',
   log_level = 'info', -- 'debug', 'info', 'warn', 'error'
 }
 

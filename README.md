@@ -24,6 +24,9 @@ the original copyright.
 | Browser cookie extraction on Linux | Upstream only supported macOS. Every profile of every detected Chrome/Chromium install is searched — including Flatpak and Snap — and the most recently used Overleaf session wins, so no cookie needs to be configured by hand. Builds on unmerged [#15](https://github.com/richwomanbtc/overleaf.nvim/pull/15). |
 | Sync race guards | Rejoin no longer wipes a populated buffer when the server returns empty, and disk writes are atomic. From unmerged [#22](https://github.com/richwomanbtc/overleaf.nvim/pull/22), plus a fix to re-arm the file watcher after the rename (`rename()` replaces the inode, which otherwise silently kills inbound sync). |
 | Buffer changes reconciled on the next tick | The old pipeline reconstructed inserted text by reading the buffer from inside the `on_bytes` callback, where the visible state is inconsistent — a join reports pre-change content, typing reports post-change. Joins, line opens, whole-buffer rewrites and multibyte edits silently corrupted the mirror and forced a rejoin. Changes now record only which lines are dirty and are diffed once the buffer has settled. Fixes [#16](https://github.com/richwomanbtc/overleaf.nvim/issues/16). |
+| Editable "binary" files | Overleaf decides doc-vs-file by extension at upload time, so an `.asm`, `.c` or other off-whitelist file is stored as an opaque fileRef even when its content is text, and the web editor refuses to open it. The plugin mirrored such files to disk once and then ignored them: edits there were silently lost and the copy went stale. Text fileRefs are now detected (UTF-8, no NUL bytes, Overleaf's own rule), kept current, opened from the tree, and re-uploaded on save, which Overleaf treats as a replace. See [Files Overleaf stores as binary](#files-overleaf-stores-as-binary). |
+| `:Overleaf upload` works against overleaf.com | Overleaf's upload endpoint takes the file's name from a separate `name` form field and answered every upload with `422 invalid_filename`, so the command had never actually worked. The bridge now sends the field. |
+| Reverting a disk edit is synced | Once an external edit had been synced, restoring the file to the bytes the plugin last wrote itself looked like the plugin's own write echoing back and was dropped, so an undo or revert by an external tool never reached Overleaf. The in-sync state is now updated when an external change is accepted. |
 | `env_file` accepts `~` and `$VAR` | `io.open` takes paths literally, so `~/.overleaf.env` was read as a directory named `~` and silently failed. Same intent as unmerged [#23](https://github.com/richwomanbtc/overleaf.nvim/pull/23). |
 
 ### Using this fork
@@ -173,7 +176,7 @@ If you accidentally paste only the value (starting with `s%3A...`), the plugin a
 | `:Overleaf open` | Open a document |
 | `:Overleaf projects` | Switch project |
 | `:Overleaf status` | Show connection status |
-| `:Overleaf preview` | Preview binary file (images, etc.) |
+| `:Overleaf preview` | Open a binary file (image, PDF) in an external viewer |
 | `:Overleaf new [name]` | Create new document |
 | `:Overleaf mkdir [name]` | Create new folder |
 | `:Overleaf delete` | Delete file/folder |
@@ -234,6 +237,10 @@ require('overleaf').setup({
   -- Local file sync directory for external tools like Claude Code (default: nil = disabled)
   -- When set, all documents are mirrored to disk and external changes are synced back.
   sync_dir = '~/.overleaf',
+  -- Files Overleaf stores as binary but whose content is text (.asm, .c, ...):
+  -- 'auto' (default) edits them by re-upload, a list like { 'asm', 'c' }
+  -- restricts that to those extensions, false leaves them download-only.
+  editable_files = 'auto',
 
   -- Set to false to disable default keymaps
   keys = true,
@@ -276,6 +283,47 @@ When connected to a project, all text documents are synced to `~/.overleaf/<proj
 - `:Overleaf sync` — re-sync all documents (fetch from Overleaf and write to disk)
 - `:Overleaf sync import` — import all external disk changes to Overleaf
 - `:Overleaf sync export` — export all documents to disk
+
+### Files Overleaf stores as binary
+
+Overleaf only stores an upload as an editable document when its extension is
+on its text whitelist (`.tex`, `.bib`, `.sty`, `.cls`, `.txt`, `.md`, and a
+few more). Anything else, an `.asm` or `.c` file for instance, becomes a
+"fileRef": an opaque blob with no real-time document behind it, which the web
+editor cannot open either. There is no OT stream to send edits into, so the
+only way to change one is to upload a replacement, which Overleaf accepts
+under the same name and folder and gives a new id.
+
+The plugin handles these as follows:
+
+- On connect, a fileRef with an unknown extension is downloaded and checked
+  the way Overleaf checks uploads: valid UTF-8 with no NUL bytes. Known
+  binary extensions (images, PDFs, archives, fonts) are skipped and fetched
+  once as before.
+- Text fileRefs are mirrored into `sync_dir`, re-fetched on every connect and
+  `:Overleaf sync` so the copy follows the server, and watched. A change on
+  disk, from Neovim or from an external tool, is re-uploaded whole.
+- `Enter` on one in the tree, or `:Overleaf open path/to/file.asm`, opens the
+  mirrored file as a plain buffer. Without a `sync_dir` the download is opened
+  from a temp directory and uploaded on every `:w`.
+- `:Overleaf sync import` and `sync export` include them.
+- A replacement made elsewhere (web upload, collaborator) is picked up from
+  the `reciveNewFile` event and re-downloaded.
+
+Caveats, since none of the real-time machinery applies:
+
+- Saves are last-writer-wins. There is no merge and no live cursors, and two
+  people editing the same fileRef will overwrite each other.
+- History records each save as a whole-file upload, not a diff.
+- Edits made to the mirror while not connected are discarded on the next
+  connect, when the server copy is written over them (a warning is logged).
+
+If you want real collaboration on such a file, rename it on Overleaf to a
+whitelisted extension (`main.asm.txt`); it becomes a document and
+`\lstinputlisting` and friends still read it.
+
+Set `editable_files = false` to restore the old download-only behaviour, or
+give a list of extensions to limit which fileRefs are treated this way.
 
 ### Usage with Claude Code
 

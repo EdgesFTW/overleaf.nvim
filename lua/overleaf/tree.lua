@@ -127,24 +127,34 @@ function M._on_enter()
   if not entry then return end
 
   if entry.type == 'doc' then
-    -- Find or create editor window to the right
-    if not M._editor_winnr or not vim.api.nvim_win_is_valid(M._editor_winnr) then
-      vim.cmd('rightbelow vsplit')
-      M._editor_winnr = vim.api.nvim_get_current_win()
-      -- Shrink tree to sidebar width
-      if M._tree_winnr and vim.api.nvim_win_is_valid(M._tree_winnr) then
-        vim.api.nvim_win_set_width(M._tree_winnr, M._width)
-        vim.wo[M._tree_winnr].winfixwidth = true
-      end
-    else
-      vim.api.nvim_set_current_win(M._editor_winnr)
-    end
+    M._focus_editor()
     -- Current window is now the editor — open_document sets buffer here
     require('overleaf').open_document(entry.id, entry.path)
   elseif entry.type == 'file' then
-    config.log('info', 'Binary files cannot be opened: %s', entry.name)
+    if entry.text == false then
+      config.log('info', 'Binary file, cannot be edited: %s (use :Overleaf preview)', entry.name)
+      return
+    end
+    -- Text content stored as a file: editable, but only by replacing it whole
+    require('overleaf').open_file_entry(entry, { prepare_window = M._focus_editor })
   end
   -- No-op for folders
+end
+
+--- Find or create the editor window to the right of the tree and focus it
+function M._focus_editor()
+  if not M._editor_winnr or not vim.api.nvim_win_is_valid(M._editor_winnr) then
+    if M._tree_winnr and vim.api.nvim_win_is_valid(M._tree_winnr) then vim.api.nvim_set_current_win(M._tree_winnr) end
+    vim.cmd('rightbelow vsplit')
+    M._editor_winnr = vim.api.nvim_get_current_win()
+    -- Shrink tree to sidebar width
+    if M._tree_winnr and vim.api.nvim_win_is_valid(M._tree_winnr) then
+      vim.api.nvim_win_set_width(M._tree_winnr, M._width)
+      vim.wo[M._tree_winnr].winfixwidth = true
+    end
+  else
+    vim.api.nvim_set_current_win(M._editor_winnr)
+  end
 end
 
 --- Get the parent folder ID of the entry under cursor
@@ -233,8 +243,10 @@ function M._rename_entry()
         return
       end
       vim.schedule(function()
+        local old_path = entry.path
         local updated = project.rename_entry(entry.id, new_name)
         if updated then
+          if entry.type == 'file' then require('overleaf.sync').rename_file(old_path, updated) end
           -- Update open buffer name if it's a doc
           if entry.type == 'doc' then
             local doc = ol._state.documents[entry.id]

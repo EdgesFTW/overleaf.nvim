@@ -38,6 +38,53 @@ function resetDocs() {
   for (const k of Object.keys(docs)) delete docs[k];
 }
 
+// ── In-memory fileRef store (binary "files", served by the filestore) ─────
+const files = {};
+let nextFileId = 1;
+
+function createFile(name, folderId, content, id) {
+  id = id || ('file_' + (nextFileId++));
+  files[id] = {
+    name,
+    folderId: folderId || 'root_folder',
+    content: Buffer.isBuffer(content) ? content : Buffer.from(content),
+  };
+  return id;
+}
+
+function resetFiles() {
+  for (const k of Object.keys(files)) delete files[k];
+}
+
+// Minimal multipart/form-data parser. Like Overleaf's upload controller, the
+// file's name is taken from the `name` field, not the file part's filename.
+function parseMultipart(body, boundary) {
+  const delim = Buffer.from('--' + boundary);
+  const fields = {};
+  let file = null;
+  let pos = body.indexOf(delim);
+  while (pos >= 0) {
+    const headerEnd = body.indexOf('\r\n\r\n', pos);
+    if (headerEnd < 0) break;
+    const header = body.slice(pos, headerEnd).toString();
+    const dataStart = headerEnd + 4;
+    const dataEnd = body.indexOf(Buffer.from('\r\n--' + boundary), dataStart);
+    if (dataEnd < 0) break;
+    const data = body.slice(dataStart, dataEnd);
+    const name = (header.match(/ name="([^"]*)"/) || [])[1];
+    const filename = (header.match(/filename="([^"]*)"/) || [])[1];
+    if (filename !== undefined) {
+      file = { field: name, originalFilename: filename, data };
+    } else if (name) {
+      fields[name] = data.toString();
+    }
+    pos = body.indexOf(delim, dataEnd + 2);
+    if (body.slice(pos + delim.length, pos + delim.length + 2).toString() === '--') break;
+  }
+  if (!file || !fields.name) return null;
+  return { filename: fields.name, data: file.data };
+}
+
 function computeHash(content) {
   return crypto
     .createHash('sha1')
@@ -280,6 +327,48 @@ function createServer(port) {
       return;
     }
 
+    // Filestore download: GET /project/:projectId/file/:fileId
+    let m = url.pathname.match(/^\/project\/([^/]+)\/file\/([^/]+)$/);
+    if (m && req.method === 'GET') {
+      const file = files[m[2]];
+      if (!file) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(file.content);
+      return;
+    }
+
+    // Upload: POST /project/:projectId/upload?folder_id=...
+    // As on real Overleaf, uploading over an existing name in the same folder
+    // replaces that fileRef under a new id and announces it with reciveNewFile.
+    m = url.pathname.match(/^\/project\/([^/]+)\/upload$/);
+    if (m && req.method === 'POST') {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const boundary = ((req.headers['content-type'] || '').match(/boundary=(.+)$/) || [])[1];
+        const part = boundary && parseMultipart(Buffer.concat(chunks), boundary);
+        if (!part) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'bad multipart body' }));
+          return;
+        }
+        const folderId = url.searchParams.get('folder_id') || 'root_folder';
+        for (const [id, f] of Object.entries(files)) {
+          if (f.folderId === folderId && f.name === part.filename) delete files[id];
+        }
+        const id = createFile(part.filename, folderId, part.data);
+        // Real signature: reciveNewFile(parentFolderId, file, source, linkedFileData, userId)
+        broadcastEvent('reciveNewFile', folderId, { _id: id, name: part.filename }, 'upload', null, 'mock_user_upload');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, entity_id: id, entity_type: 'file' }));
+      });
+      return;
+    }
+
     res.writeHead(404);
     res.end('Not found');
   });
@@ -353,6 +442,9 @@ function createServer(port) {
         resetDocs,
         getDocs: () => docs,
         getOrCreateDoc,
+        getFiles: () => files,
+        createFile,
+        resetFiles,
         getClients: () => clients,
         close: () => new Promise((r) => {
           for (const c of clients) c.ws.close();
@@ -434,4 +526,7 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore };
+module.exports = {
+  createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore,
+  createFile, resetFiles, getFiles: () => files,
+};

@@ -4,6 +4,7 @@ local M = {}
 
 M._projects = {}
 M._project_tree = {} -- flat list of {id, name, path}
+M._root_folder_id = nil -- the project's root folder; uploads need a real folder id
 
 function M.set_projects(projects) M._projects = projects or {} end
 
@@ -36,6 +37,7 @@ function M.parse_project_tree(project)
 
   local root = project.rootFolder
   if type(root) == 'table' and root[1] then root = root[1] end
+  M._root_folder_id = root and root._id or nil
 
   M._walk_folder(root, '')
   return M._project_tree
@@ -181,6 +183,20 @@ function M.remove_entry(entity_id)
     end
   end
   return false
+end
+
+--- Get the id of the folder containing an entry (the root folder for
+--- top-level entries).
+---@param entry table tree entry
+---@return string|nil
+function M.get_parent_folder_id(entry)
+  local parent_path = entry.path:match('^(.*/)') or ''
+  if parent_path ~= '' then
+    for _, e in ipairs(M._project_tree) do
+      if e.type == 'folder' and e.path == parent_path then return e.id end
+    end
+  end
+  return M._root_folder_id
 end
 
 --- Get the path prefix for a parent folder

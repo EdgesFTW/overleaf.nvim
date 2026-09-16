@@ -331,9 +331,24 @@ function M._setup_event_handlers()
   bridge.on_event('reciveNewFile', function(data)
     if not data or not data.file then return end
     local file = data.file
+    local new_id = file._id or file.id
     local parent_path = project.get_folder_path(data.parentFolderId)
     local path = parent_path .. (file.name or '')
-    if not project.path_exists(path) then
+    local existing = project.get_doc_by_path(path)
+    local entry
+
+    if existing and existing.type == 'file' then
+      -- Same path, new id: an upload over an existing name replaces the
+      -- fileRef. Keep the entry (and its text flag) and take on the new id,
+      -- unless it already carries it because the upload was ours.
+      if existing.id == new_id then return end
+      config.log('debug', 'File replaced on Overleaf: %s (%s -> %s)', path, existing.id, new_id)
+      existing.id = new_id
+      entry = existing
+    elseif existing then
+      config.log('warn', 'Ignoring file %s: a document already has that path', path)
+      return
+    else
       local depth = 0
       if data.parentFolderId then
         for _, e in ipairs(project._project_tree) do
@@ -343,14 +358,12 @@ function M._setup_event_handlers()
           end
         end
       end
-      project.add_entry({
-        id = file._id or file.id,
-        name = file.name,
-        path = path,
-        type = 'file',
-        depth = depth,
-      })
+      entry = { id = new_id, name = file.name, path = path, type = 'file', depth = depth }
+      project.add_entry(entry)
     end
+
+    -- Refresh the mirror so a replacement made elsewhere shows up on disk
+    if sync.active() and M._state.project_id then sync.fetch_file(entry, M._state.project_id) end
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
 
@@ -366,6 +379,11 @@ function M._setup_event_handlers()
       return
     end
 
+    -- A fileRef replaced by an upload (ours or anyone's) arrives as
+    -- removeEntity(old id, 'upload') followed by reciveNewFile(new id): the
+    -- entry is dropped here and re-added, re-fetched and re-watched there.
+    local entry = project.get_doc_by_id(data.entityId)
+    if entry and entry.type == 'file' then sync.forget_file(entry) end
     project.remove_entry(data.entityId)
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
@@ -531,7 +549,10 @@ function M.open_document(doc_id_or_path, doc_path)
   if not path then
     -- Assume it's a path, look up ID
     local info = project.get_doc_by_path(doc_id_or_path)
-    if info then
+    if info and info.type == 'file' then
+      M.open_file_entry(info)
+      return
+    elseif info then
       doc_id = info.id
       path = info.path
     else
@@ -572,6 +593,57 @@ function M.open_document(doc_id_or_path, doc_path)
         if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then comments.render(doc.bufnr, doc_id, doc.content) end
       end)
     end
+  end)
+end
+
+--- Open a fileRef (a file Overleaf stores as binary) for editing.
+--- Text fileRefs have no OT document, so the buffer is a plain file: with a
+--- sync directory the mirror's watcher re-uploads it on save; without one the
+--- temp download is uploaded from BufWritePost.
+---@param entry table tree entry {id, name, path, type='file'}
+---@param opts table|nil { prepare_window = function } called before the buffer is shown
+function M.open_file_entry(entry, opts)
+  opts = opts or {}
+  if not M._state.connected then
+    config.log('warn', 'Not connected.')
+    return
+  end
+
+  local function refuse() config.log('info', 'Binary file, cannot be edited: %s (use :Overleaf preview)', entry.name) end
+  if entry.text == false then
+    refuse()
+    return
+  end
+
+  sync.fetch_file(entry, M._state.project_id, function(err, local_path)
+    if err then
+      config.log('error', 'Download failed for %s: %s', entry.path, err.message)
+      return
+    end
+    if not entry.text then
+      refuse()
+      return
+    end
+
+    vim.schedule(function()
+      if opts.prepare_window then opts.prepare_window() end
+      vim.cmd('edit ' .. vim.fn.fnameescape(local_path))
+      local bufnr = vim.api.nvim_get_current_buf()
+      vim.b[bufnr].overleaf_file = entry.path
+
+      if not sync.active() then
+        vim.api.nvim_create_autocmd('BufWritePost', {
+          buffer = bufnr,
+          callback = function() sync.upload_file(entry, local_path) end,
+        })
+      end
+
+      config.log(
+        'info',
+        '%s is stored as a file on Overleaf: each save replaces it whole (no live collaboration)',
+        entry.name
+      )
+    end)
   end)
 end
 
@@ -811,6 +883,7 @@ function M.upload_file(file_path, parent_folder_id)
     local file_name = vim.fn.fnamemodify(path, ':t')
     config.log('info', 'Uploading %s...', file_name)
 
+    parent_folder_id = parent_folder_id or project._root_folder_id
     bridge.request('uploadFile', {
       cookie = config.get().cookie,
       csrfToken = M._state.csrf_token,
@@ -818,13 +891,17 @@ function M.upload_file(file_path, parent_folder_id)
       filePath = path,
       fileName = file_name,
       parentFolderId = parent_folder_id,
-    }, function(err, _result)
+    }, function(err, result)
       if err then
         config.log('error', 'Upload failed: %s', err.message)
         return
       end
       config.log('info', 'Uploaded: %s', file_name)
-      -- Tree update happens via reciveNewFile socket event
+      -- Tree update happens via the reciveNewFile socket event. Uploading over
+      -- an existing name replaces that fileRef under a new id; record it now
+      -- in case the event already came and went.
+      local existing = project.get_doc_by_path(project.get_folder_path(parent_folder_id) .. file_name)
+      if existing and existing.type == 'file' and result and result.entity_id then existing.id = result.entity_id end
     end)
   end
 
@@ -1073,9 +1150,7 @@ function M.set_main_file(name)
 
   vim.ui.select(candidates, {
     prompt = 'Set main document (compiled by :Overleaf compile):',
-    format_item = function(item)
-      return (item.id == M._state.root_doc_id and '* ' or '  ') .. item.path
-    end,
+    format_item = function(item) return (item.id == M._state.root_doc_id and '* ' or '  ') .. item.path end,
   }, function(choice)
     if choice then apply(choice) end
   end)

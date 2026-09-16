@@ -242,8 +242,15 @@ function httpPostMultipart(url, cookie, csrfToken, filePath, fileName) {
 
     const fileData = fs.readFileSync(filePath);
 
-    // Build multipart body
+    // Build multipart body. Overleaf's upload controller takes the file's name
+    // from a separate `name` field (the web client sends it as Uppy metadata)
+    // and answers 422 invalid_filename when it is missing, whatever the
+    // filename in the file part says.
     const parts = [];
+    const field = (name, value) =>
+      parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
+    field('name', fileName);
+    field('type', 'application/octet-stream');
     parts.push(`--${boundary}\r\n`);
     parts.push(`Content-Disposition: form-data; name="qqfile"; filename="${fileName}"\r\n`);
     parts.push(`Content-Type: application/octet-stream\r\n\r\n`);
