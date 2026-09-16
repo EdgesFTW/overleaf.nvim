@@ -37,7 +37,13 @@ local function fake_bridge(store, calls, opts)
       table.insert(calls, { method = 'uploaded-bytes', data = sent })
       local new_id = 'file_' .. tostring(#calls)
       store[new_id] = sent
-      return callback(nil, { success = true, entity_id = new_id, entity_type = 'file' })
+      local function respond() callback(nil, { success = true, entity_id = new_id, entity_type = 'file' }) end
+      if opts.hold_uploads then
+        opts.held = opts.held or {}
+        table.insert(opts.held, respond)
+        return
+      end
+      return respond()
     elseif method == 'joinDoc' then
       opts.doc_content = opts.doc_content or table.concat(opts.doc_lines or { '' }, '\n')
       opts.doc_version = opts.doc_version or 0
@@ -281,6 +287,25 @@ describe('sync', function()
       write_file(path, 'mov eax, 1\n') -- back to what fetch_file wrote: still a real change
       assert.is_true(vim.wait(5000, function() return #calls_of(calls, 'uploadFile') > 1 end))
       assert.are.equal('mov eax, 1\n', calls_of(calls, 'uploaded-bytes')[2].data)
+    end)
+
+    it('does not resend bytes a direct upload already has in flight (a :w in Neovim)', function()
+      local held = { hold_uploads = true }
+      bridge.request = fake_bridge({ file_asm = 'mov eax, 1\n' }, calls, held)
+      write_file(path, 'mov eax, 7\n') -- what BufWritePost sees on disk
+      local finished
+      sync.upload_file(entry, path, nil, function(err)
+        assert.is_nil(err)
+        finished = true
+      end)
+      -- the watcher fires for the same write while the upload is still pending
+      vim.wait(1500, function() return false end)
+      assert.are.equal(1, #calls_of(calls, 'uploadFile'))
+      held.held[1]()
+      assert.is_true(vim.wait(1000, function() return finished end))
+      vim.wait(800, function() return false end)
+      assert.are.equal(1, #calls_of(calls, 'uploadFile'))
+      assert.are.equal('mov eax, 7\n', sync._files['src/main.asm'].content)
     end)
 
     it('does not upload our own mirror write or unchanged content', function()

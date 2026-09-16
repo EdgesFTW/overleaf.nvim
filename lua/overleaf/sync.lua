@@ -29,6 +29,7 @@ M._files = {} -- doc path -> { entry = tree entry, content = last known bytes }
 M._file_watchers = {} -- disk path -> fs_event handle
 M._file_timers = {} -- disk path -> debounce timer
 M._last_uploaded = {} -- disk path -> the exact bytes last sent to Overleaf
+M._uploading = {} -- disk path -> bytes of an upload in flight (so the watcher does not resend them)
 
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
@@ -70,6 +71,7 @@ function M.stop()
   M._file_timers = {}
   M._files = {}
   M._last_uploaded = {}
+  M._uploading = {}
 
   M._sync_dir = nil
 end
@@ -564,6 +566,7 @@ function M._on_file_ref_changed(path, entry)
     local known = M._files[entry.path]
     if data == M._last_written[path] then return end -- our own mirror write
     if data == M._last_uploaded[path] then return end -- already on Overleaf
+    if data == M._uploading[path] then return end -- on its way (a :w in Neovim uploads directly)
     if known and data == known.content then return end
 
     -- Same guard as docs: a truncated read mid-write must not wipe the file
@@ -596,6 +599,7 @@ function M.upload_file(entry, local_path, data, callback)
   end
 
   data = data or read_bytes(local_path)
+  if data then M._uploading[local_path] = data end
   config.log('info', 'Uploading %s...', entry.path)
   bridge.request('uploadFile', {
     cookie = config.get().cookie,
@@ -605,6 +609,7 @@ function M.upload_file(entry, local_path, data, callback)
     fileName = entry.name,
     parentFolderId = project.get_parent_folder_id(entry),
   }, function(err, result)
+    if M._uploading[local_path] == data then M._uploading[local_path] = nil end
     if err then
       config.log('error', 'Upload failed for %s: %s', entry.path, err.message)
       callback(err)

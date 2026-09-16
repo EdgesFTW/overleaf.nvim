@@ -304,8 +304,9 @@ The plugin handles these as follows:
   `:Overleaf sync` so the copy follows the server, and watched. A change on
   disk, from Neovim or from an external tool, is re-uploaded whole.
 - `Enter` on one in the tree, or `:Overleaf open path/to/file.asm`, opens the
-  mirrored file as a plain buffer. Without a `sync_dir` the download is opened
-  from a temp directory and uploaded on every `:w`.
+  mirrored file as a plain buffer. `:w` uploads it and then compiles, as it
+  does for documents. Without a `sync_dir` the download is opened from a temp
+  directory instead.
 - `:Overleaf sync import` and `sync export` include them.
 - A replacement made elsewhere (web upload, collaborator) is picked up from
   the `reciveNewFile` event and re-downloaded.

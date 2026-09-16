@@ -597,9 +597,10 @@ function M.open_document(doc_id_or_path, doc_path)
 end
 
 --- Open a fileRef (a file Overleaf stores as binary) for editing.
---- Text fileRefs have no OT document, so the buffer is a plain file: with a
---- sync directory the mirror's watcher re-uploads it on save; without one the
---- temp download is uploaded from BufWritePost.
+--- Text fileRefs have no OT document, so the buffer is a plain file. As with
+--- docs, :w sends the change to Overleaf (here: a whole-file re-upload) and
+--- then compiles. With a sync directory the mirror's watcher also covers
+--- edits made by external tools.
 ---@param entry table tree entry {id, name, path, type='file'}
 ---@param opts table|nil { prepare_window = function } called before the buffer is shown
 function M.open_file_entry(entry, opts)
@@ -631,12 +632,16 @@ function M.open_file_entry(entry, opts)
       local bufnr = vim.api.nvim_get_current_buf()
       vim.b[bufnr].overleaf_file = entry.path
 
-      if not sync.active() then
-        vim.api.nvim_create_autocmd('BufWritePost', {
-          buffer = bufnr,
-          callback = function() sync.upload_file(entry, local_path) end,
-        })
-      end
+      -- :w uploads directly (the watcher skips bytes already in flight) so the
+      -- compile can follow the upload, as it follows the OT flush for docs.
+      vim.api.nvim_create_autocmd('BufWritePost', {
+        buffer = bufnr,
+        callback = function()
+          sync.upload_file(entry, local_path, nil, function(upload_err)
+            if not upload_err then M.compile() end
+          end)
+        end,
+      })
 
       config.log(
         'info',
