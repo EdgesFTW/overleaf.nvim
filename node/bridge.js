@@ -63,10 +63,25 @@ function fetchToFile(url, cookie, destPath, redirectsLeft = 5) {
         return;
       }
       // Written only for a confirmed 200, so a failure leaves no partial file.
-      const ws = fs.createWriteStream(destPath, { mode: 0o600 });
+      // Staged through a sibling and renamed, which is atomic within a
+      // directory: a PDF viewer watching destPath for changes sees either the
+      // previous build or the new one, never a truncated stream.
+      const partPath = destPath + '.part';
+      const ws = fs.createWriteStream(partPath, { mode: 0o600 });
       res.pipe(ws);
-      ws.on('finish', () => { ws.close(); resolve(); });
-      ws.on('error', reject);
+      ws.on('finish', () => {
+        ws.close(() => {
+          try {
+            fs.renameSync(partPath, destPath);
+            resolve();
+          } catch (e) {
+            reject({ code: 'DOWNLOAD_FAILED', message: `Could not replace ${destPath}: ${e.message}` });
+          }
+        });
+      });
+      ws.on('error', (e) => {
+        fs.unlink(partPath, () => reject(e));
+      });
     }).on('error', reject);
   });
 }

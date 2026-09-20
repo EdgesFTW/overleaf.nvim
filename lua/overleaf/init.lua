@@ -36,6 +36,8 @@ M._state = {
   csrf_token = nil,
   root_doc_id = nil, -- project's main document; Overleaf compiles this one
   documents = {}, -- doc_id -> Document
+  pdf_path = nil, -- where the last compile's output.pdf landed
+  pdf_opened = {}, -- path -> true once a viewer has been launched for it
 }
 
 -- Suffixes appended to config.keymap_prefix. Kept as data so the prefix is the
@@ -52,6 +54,7 @@ local DEFAULT_KEYMAPS = {
   { 'x', 'Resolve/reopen comment', function() M.resolve_comment() end },
   { 'f', 'Find in project', function() M.search() end },
   { 'm', 'Set main document', function() M.set_main_file() end },
+  { 'v', 'View PDF', function() M.open_pdf() end },
 }
 
 function M.setup(opts)
@@ -1205,9 +1208,36 @@ function M._open_pdf(output_files, clsi_server_id)
       config.log('error', 'PDF download failed: %s', err.message)
       return
     end
+    M._state.pdf_path = result.path
+
+    -- The file was replaced in place, so a viewer already showing it has the
+    -- new build. Launching it again would only pull focus away from the
+    -- buffer, which makes compiling on every :w unusable.
+    local mode = config.get().pdf_auto_open
+    local launch = mode == 'always' or (mode == 'once' and not M._state.pdf_opened[result.path])
+    if not launch then
+      config.log('info', 'PDF updated: %s', result.path)
+      return
+    end
+
+    M._state.pdf_opened[result.path] = true
     config.log('info', 'Opening %s', result.path)
     vim.schedule(function() open_file(result.path) end)
   end)
+end
+
+--- Open the last compiled PDF in the viewer, focus and all. This is the way
+--- back when the viewer has been closed and `pdf_auto_open` will not relaunch
+--- it by itself.
+function M.open_pdf()
+  local path = M._state.pdf_path
+  if not path or vim.fn.filereadable(path) == 0 then
+    config.log('warn', 'No compiled PDF yet. Run :Overleaf compile first.')
+    return
+  end
+  M._state.pdf_opened[path] = true
+  config.log('info', 'Opening %s', path)
+  open_file(path)
 end
 
 function M._parse_compile_log(log_text)
@@ -1602,6 +1632,8 @@ function M.disconnect()
   M._state.project_id = nil
   M._state.project_data = nil
   M._state.csrf_token = nil
+  M._state.pdf_path = nil
+  M._state.pdf_opened = {}
 
   config.log('info', 'Disconnected')
 end

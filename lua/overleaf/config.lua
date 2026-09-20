@@ -7,6 +7,13 @@ M._config = {
   base_url = 'https://www.overleaf.com', -- Overleaf instance URL (for self-hosted)
   pdf_viewer = nil, -- PDF viewer command (nil = auto-detect: 'open' on macOS, 'xdg-open' on Linux)
   pdf_dir = nil, -- PDF output directory (nil = a private per-user dir under the system temp dir)
+  -- When a compile should hand the PDF to the viewer. Every compile rewrites
+  -- the same path atomically, so a viewer that reloads on change stays current
+  -- without being launched again -- and without stealing focus from Neovim.
+  --   'once'   - launch the viewer for the first compile of a session only
+  --   'always' - launch it after every compile (the old behaviour)
+  --   false    - never; ':Overleaf pdf' opens it on demand
+  pdf_auto_open = 'once',
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
   -- Files Overleaf stores as binary "fileRefs" (anything whose extension is
   -- not on its text whitelist, e.g. .asm or .c) have no real-time document

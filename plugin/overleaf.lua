@@ -9,6 +9,7 @@ local subcommands = {
   projects = function() require('overleaf').select_project() end,
   status = function() require('overleaf').status() end,
   preview = function() require('overleaf').preview_file() end,
+  pdf = function() require('overleaf').open_pdf() end,
   new = function(args) require('overleaf').create_doc(args) end,
   mkdir = function(args) require('overleaf').create_folder(args) end,
   delete = function() require('overleaf').delete_entity() end,

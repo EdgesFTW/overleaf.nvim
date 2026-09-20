@@ -27,6 +27,7 @@ the original copyright.
 | Editable "binary" files | Overleaf decides doc-vs-file by extension at upload time, so an `.asm`, `.c` or other off-whitelist file is stored as an opaque fileRef even when its content is text, and the web editor refuses to open it. The plugin mirrored such files to disk once and then ignored them: edits there were silently lost and the copy went stale. Text fileRefs are now detected (UTF-8, no NUL bytes, Overleaf's own rule), kept current, opened from the tree, and re-uploaded on save, which Overleaf treats as a replace. See [Files Overleaf stores as binary](#files-overleaf-stores-as-binary). |
 | `:Overleaf upload` works against overleaf.com | Overleaf's upload endpoint takes the file's name from a separate `name` form field and answered every upload with `422 invalid_filename`, so the command had never actually worked. The bridge now sends the field. |
 | Reverting a disk edit is synced | Once an external edit had been synced, restoring the file to the bytes the plugin last wrote itself looked like the plugin's own write echoing back and was dropped, so an undo or revert by an external tool never reached Overleaf. The in-sync state is now updated when an external change is accepted. |
+| Compiling does not steal focus | Every compile relaunched the PDF viewer, so the window manager pulled focus away from Neovim — which makes compiling on `:w` unusable. The output is written to the same path on every build, so a viewer that reloads on change is already current; `pdf_auto_open` now launches it for the first compile only by default, and downloads are staged through a sibling file and renamed so a watching viewer never reads a half-written PDF. |
 | Relocatable keymap prefix | Every default key was hardcoded under `<leader>o`, and the documented `keys = false` escape hatch did not work (`opts.keys or true` is always truthy), so a collision with another `<leader>o` plugin could only be resolved by unmapping keys by hand. `keymap_prefix` moves the whole set, `keymaps = false` disables it, and the prefix is labelled in which-key when it is installed. |
 | `env_file` accepts `~` and `$VAR` | `io.open` takes paths literally, so `~/.overleaf.env` was read as a directory named `~` and silently failed. Same intent as unmerged [#23](https://github.com/richwomanbtc/overleaf.nvim/pull/23). |
 
@@ -178,6 +179,7 @@ If you accidentally paste only the value (starting with `s%3A...`), the plugin a
 | `:Overleaf projects` | Switch project |
 | `:Overleaf status` | Show connection status |
 | `:Overleaf preview` | Open a binary file (image, PDF) in an external viewer |
+| `:Overleaf pdf` | Open the last compiled PDF in the viewer |
 | `:Overleaf new [name]` | Create new document |
 | `:Overleaf mkdir [name]` | Create new folder |
 | `:Overleaf delete` | Delete file/folder |
@@ -211,6 +213,7 @@ All of these hang off `keymap_prefix`, `<leader>o` by default. Setting
 | `<leader>ox` | Resolve/reopen comment |
 | `<leader>of` | Find in project (search) |
 | `<leader>om` | Set main document |
+| `<leader>ov` | View the compiled PDF |
 
 ### Tree Keymaps
 
@@ -240,6 +243,12 @@ require('overleaf').setup({
 
   -- Log level: 'debug', 'info', 'warn', 'error' (default: 'info')
   log_level = 'info',
+
+  -- When a finished compile hands the PDF to the viewer. Every compile rewrites
+  -- the same path atomically, so a viewer that reloads on change is already
+  -- current: 'once' (default) launches it for the first compile of a session,
+  -- 'always' after every compile, false never (':Overleaf pdf' opens it).
+  pdf_auto_open = 'once',
 
   -- Local file sync directory for external tools like Claude Code (default: nil = disabled)
   -- When set, all documents are mirrored to disk and external changes are synced back.
