@@ -53,7 +53,7 @@ describe('default keymaps', function()
     assert.are.equal('Overleaf: Build (compile)', maps[' ob'])
     assert.are.equal('Overleaf: Set main document', maps[' om'])
     assert.are.equal('Overleaf: View PDF', maps[' ov'])
-    assert.are.equal(12, #sorted_keys(maps))
+    assert.are.equal(13, #sorted_keys(maps))
   end)
 
   it('moves every key when the prefix changes', function()
@@ -63,7 +63,7 @@ describe('default keymaps', function()
     local maps = overleaf_maps()
     assert.are.equal('Overleaf: Connect', maps[' olc'])
     assert.are.equal('Overleaf: Build (compile)', maps[' olb'])
-    assert.are.equal(12, #sorted_keys(maps))
+    assert.are.equal(13, #sorted_keys(maps))
 
     -- The old prefix is left free for whatever claimed it.
     assert.is_nil(maps[' oc'])

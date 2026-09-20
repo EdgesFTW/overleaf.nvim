@@ -10,6 +10,7 @@ local subcommands = {
   status = function() require('overleaf').status() end,
   preview = function() require('overleaf').preview_file() end,
   pdf = function() require('overleaf').open_pdf() end,
+  forward = function() require('overleaf').forward_search() end,
   new = function(args) require('overleaf').create_doc(args) end,
   mkdir = function(args) require('overleaf').create_folder(args) end,
   delete = function() require('overleaf').delete_entity() end,

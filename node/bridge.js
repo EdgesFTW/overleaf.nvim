@@ -12,6 +12,13 @@ console.log = (...args) => console.error('[bridge]', ...args);
 
 const BASE_URL = process.env.OVERLEAF_URL || 'https://www.overleaf.com';
 
+// SyncTeX is keyed by an editor id the *client* invents. The same one has to be
+// sent on the compile and on the sync lookup: omit it and Overleaf forwards
+// `editorId=undefined` to the CLSI and answers 500; send one that does not match
+// the build and it answers 404. One per bridge process is enough, since a build
+// outlives nothing longer than the session that made it.
+const EDITOR_ID = require('crypto').randomUUID();
+
 let requestId = 0;
 let socketManager = null;
 let pendingRequests = 0;
@@ -98,6 +105,25 @@ function downloadDir(outputDir) {
   return dir;
 }
 
+// Both SyncTeX directions answer with JSON and use the same failure modes:
+// 404 once the build has been evicted, 400 for a path the server will not accept.
+async function syncTexRequest(cookie, url) {
+  const res = await auth.httpGet(url, auth.normalizeCookie(cookie).cookie);
+  if (res.status === 404) {
+    throw { code: 'SYNCTEX_NO_BUILD', message: 'The compiled build is gone; compile again' };
+  }
+  if (res.status !== 200) {
+    let detail = '';
+    try {
+      detail = ': ' + (JSON.parse(res.body).error || '');
+    } catch (e) {
+      /* the error page is HTML, which says nothing useful */
+    }
+    throw { code: 'SYNCTEX_FAILED', message: `SyncTeX lookup failed with status ${res.status}${detail}` };
+  }
+  return JSON.parse(res.body);
+}
+
 const handlers = {
   async ping(params) {
     return { status: 'ok' };
@@ -169,7 +195,7 @@ const handlers = {
     }
 
     const compileRes = await auth.httpPost(
-      `${BASE_URL}/project/${projectId}/compile?auto_compile=true`,
+      `${BASE_URL}/project/${projectId}/compile?auto_compile=true&editorId=${EDITOR_ID}`,
       cookie, csrfToken,
       { check: 'silent', draft: false, incrementalCompilesEnabled: true, stopOnFirstError: false }
     );
@@ -194,6 +220,11 @@ const handlers = {
       else console.log(`Failed to fetch compile log: status ${logRes.status}`);
     }
 
+    // SyncTeX addresses a build, not a project. The id is only exposed inside
+    // the output URLs: /project/:id/user/:uid/build/<buildId>/output/output.pdf
+    const pdfFile = (parsed.outputFiles || []).find(f => f.path === 'output.pdf');
+    const buildMatch = pdfFile && pdfFile.url && pdfFile.url.match(/\/build\/([^/]+)\//);
+
     return {
       status: parsed.status,
       outputFiles: parsed.outputFiles || [],
@@ -201,7 +232,43 @@ const handlers = {
       clsiServerId: parsed.clsiServerId || null,
       compileGroup: parsed.compileGroup || null,
       pdfDownloadDomain: parsed.pdfDownloadDomain || null,
+      buildId: buildMatch ? buildMatch[1] : null,
+      editorId: EDITOR_ID,
     };
+  },
+
+  // Forward search: a place in the source -> where it landed in the PDF.
+  async syncCode(params) {
+    const { cookie, projectId, file, line, column, buildId, clsiServerId } = params;
+    if (!cookie || !projectId || !file || !buildId) {
+      throw { code: 'MISSING_PARAM', message: 'cookie, projectId, file and buildId are required' };
+    }
+    const query = new URLSearchParams({
+      file,
+      line: String(line),
+      column: String(column == null ? 0 : column),
+      buildId,
+      editorId: EDITOR_ID,
+    });
+    if (clsiServerId) query.set('clsiserverid', clsiServerId);
+    return await syncTexRequest(cookie, `${BASE_URL}/project/${projectId}/sync/code?${query}`);
+  },
+
+  // Inverse search: a point on a PDF page -> the source that produced it.
+  async syncPdf(params) {
+    const { cookie, projectId, page, h, v, buildId, clsiServerId } = params;
+    if (!cookie || !projectId || page == null || h == null || v == null || !buildId) {
+      throw { code: 'MISSING_PARAM', message: 'cookie, projectId, page, h, v and buildId are required' };
+    }
+    const query = new URLSearchParams({
+      page: String(page),
+      h: Number(h).toFixed(2),
+      v: Number(v).toFixed(2),
+      buildId,
+      editorId: EDITOR_ID,
+    });
+    if (clsiServerId) query.set('clsiserverid', clsiServerId);
+    return await syncTexRequest(cookie, `${BASE_URL}/project/${projectId}/sync/pdf?${query}`);
   },
 
   async downloadUrl(params) {

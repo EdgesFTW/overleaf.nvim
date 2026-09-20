@@ -4,16 +4,23 @@ local project = require('overleaf.project')
 local Document = require('overleaf.document')
 local buffer = require('overleaf.buffer')
 local sync = require('overleaf.sync')
+local viewer = require('overleaf.viewer')
 
 local M = {}
 
 --- Open a file with the configured viewer or platform default
 ---@param file_path string
+---@return number|nil pid of the viewer, when it was started by us
 local function open_file(file_path)
-  local viewer = config.get().pdf_viewer
-  if viewer then
+  local viewer_cmd = config.get().pdf_viewer
+  if viewer_cmd then
     -- User-configured viewer: run as background job to avoid disrupting cursor/window layout
-    vim.fn.jobstart({ viewer, file_path }, { detach = true })
+    local job = vim.fn.jobstart({ viewer_cmd, file_path }, { detach = true })
+    if job > 0 then
+      local ok, pid = pcall(vim.fn.jobpid, job)
+      if ok then return pid end
+    end
+    return nil
   else
     -- vim.ui.open() spawns with detach=true and, for xdg-open, with the stdout
     -- and stderr pipes disabled: the viewer is reparented to init (so it leaves
@@ -25,6 +32,7 @@ local function open_file(file_path)
     -- mac/wsl/else detection it replaces.
     local _, err = vim.ui.open(file_path)
     if err then config.log('error', 'Could not open %s: %s', file_path, err) end
+    return nil
   end
 end
 
@@ -38,6 +46,9 @@ M._state = {
   documents = {}, -- doc_id -> Document
   pdf_path = nil, -- where the last compile's output.pdf landed
   pdf_opened = {}, -- path -> true once a viewer has been launched for it
+  pdf_pid = nil, -- viewer process, when we started it (used to find it on D-Bus)
+  build_id = nil, -- the build SyncTeX lookups address
+  clsi_server_id = nil, -- CLSI node holding that build
 }
 
 -- Suffixes appended to config.keymap_prefix. Kept as data so the prefix is the
@@ -55,6 +66,7 @@ local DEFAULT_KEYMAPS = {
   { 'f', 'Find in project', function() M.search() end },
   { 'm', 'Set main document', function() M.set_main_file() end },
   { 'v', 'View PDF', function() M.open_pdf() end },
+  { 's', 'Forward search (SyncTeX)', function() M.forward_search() end },
 }
 
 function M.setup(opts)
@@ -1113,6 +1125,11 @@ function M.compile()
       return
     end
 
+    -- Kept even on a failed compile: the ids address the build, and a stale
+    -- build still answers SyncTeX until the server evicts it.
+    M._state.build_id = result.buildId
+    M._state.clsi_server_id = result.clsiServerId
+
     if result.status == 'success' then
       config.log('info', 'Compile succeeded')
       -- Auto-download and open PDF
@@ -1222,7 +1239,7 @@ function M._open_pdf(output_files, clsi_server_id)
 
     M._state.pdf_opened[result.path] = true
     config.log('info', 'Opening %s', result.path)
-    vim.schedule(function() open_file(result.path) end)
+    vim.schedule(function() M._state.pdf_pid = open_file(result.path) end)
   end)
 end
 
@@ -1237,7 +1254,90 @@ function M.open_pdf()
   end
   M._state.pdf_opened[path] = true
   config.log('info', 'Opening %s', path)
-  open_file(path)
+  M._state.pdf_pid = open_file(path)
+end
+
+--- The project path of what a buffer is showing: a live document, or a file
+--- opened from the mirror. nil for anything else.
+---@param bufnr number
+---@return string|nil
+function M._source_path(bufnr)
+  bufnr = bufnr == 0 and vim.api.nvim_get_current_buf() or bufnr
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr == bufnr then return doc.path end
+  end
+  return vim.b[bufnr].overleaf_file
+end
+
+--- Move the PDF viewer to whatever the cursor is sitting on.
+function M.forward_search()
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    return
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local path = M._source_path(bufnr)
+  if not path then
+    config.log('warn', 'This buffer is not part of the Overleaf project')
+    return
+  end
+  if not M._state.build_id then
+    config.log('warn', 'Nothing compiled yet. Run :Overleaf compile first.')
+    return
+  end
+  if not M._state.pdf_path then
+    config.log('warn', 'No PDF to move. Run :Overleaf compile first.')
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  -- Read once, up front: a disconnect between the request and its answer would
+  -- otherwise leave the callback with no PDF to move.
+  local pdf_path, pdf_pid = M._state.pdf_path, M._state.pdf_pid
+
+  bridge.request('syncCode', {
+    cookie = config.get().cookie,
+    projectId = M._state.project_id,
+    file = path,
+    line = cursor[1],
+    column = cursor[2] + 1,
+    buildId = M._state.build_id,
+    clsiServerId = M._state.clsi_server_id,
+  }, function(err, result)
+    if err then
+      config.log('error', 'Forward search failed: %s', err.message)
+      return
+    end
+
+    local hits = result and result.pdf or {}
+    if #hits == 0 then
+      -- Overleaf answers 200 with an empty list for a line that produced no
+      -- output at all, and for a file the build never read.
+      config.log('info', 'No PDF position for %s:%d', path, cursor[1])
+      return
+    end
+
+    -- Everything SyncTeX returns for one place is on one page in practice, but
+    -- only boxes on the page we jump to can be highlighted.
+    local page = hits[1].page
+    local rects = {}
+    for _, hit in ipairs(hits) do
+      if hit.page == page then
+        -- SyncTeX gives the baseline; the box grows upwards from it.
+        table.insert(rects, { hit.h, hit.v - hit.height, hit.h + hit.width, hit.v })
+      end
+    end
+
+    vim.schedule(function()
+      local ok, view_err = viewer.show(pdf_path, page, rects, pdf_pid)
+      if ok then
+        config.log('info', 'Forward search: %s:%d -> page %d', path, cursor[1], page)
+      else
+        config.log('warn', '%s', view_err)
+      end
+    end)
+  end)
 end
 
 function M._parse_compile_log(log_text)
@@ -1634,6 +1734,9 @@ function M.disconnect()
   M._state.csrf_token = nil
   M._state.pdf_path = nil
   M._state.pdf_opened = {}
+  M._state.pdf_pid = nil
+  M._state.build_id = nil
+  M._state.clsi_server_id = nil
 
   config.log('info', 'Disconnected')
 end
