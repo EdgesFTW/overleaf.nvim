@@ -38,25 +38,41 @@ M._state = {
   documents = {}, -- doc_id -> Document
 }
 
+-- Suffixes appended to config.keymap_prefix. Kept as data so the prefix is the
+-- only thing that has to move when another plugin claims the same leader key.
+local DEFAULT_KEYMAPS = {
+  { 'c', 'Connect', function() M.connect() end },
+  { 'd', 'Disconnect', function() M.disconnect() end },
+  { 'b', 'Build (compile)', function() M.compile() end },
+  { 't', 'Toggle tree', function() M.toggle_tree() end },
+  { 'o', 'Open document', function() M.select_document() end },
+  { 'p', 'Preview file', function() M.preview_file() end },
+  { 'r', 'Read comment', function() M.show_comment() end },
+  { 'R', 'Reply to comment', function() M.reply_comment() end },
+  { 'x', 'Resolve/reopen comment', function() M.resolve_comment() end },
+  { 'f', 'Find in project', function() M.search() end },
+  { 'm', 'Set main document', function() M.set_main_file() end },
+}
+
 function M.setup(opts)
   config.setup(opts)
+  M._set_keymaps()
+end
 
-  -- Default keymaps (prefix: <leader>o for Overleaf)
-  local keys = opts and opts.keys or true
-  if keys then
-    local map = vim.keymap.set
-    map('n', '<leader>oc', function() M.connect() end, { desc = 'Overleaf: Connect' })
-    map('n', '<leader>od', function() M.disconnect() end, { desc = 'Overleaf: Disconnect' })
-    map('n', '<leader>ob', function() M.compile() end, { desc = 'Overleaf: Build (compile)' })
-    map('n', '<leader>ot', function() M.toggle_tree() end, { desc = 'Overleaf: Toggle tree' })
-    map('n', '<leader>oo', function() M.select_document() end, { desc = 'Overleaf: Open document' })
-    map('n', '<leader>op', function() M.preview_file() end, { desc = 'Overleaf: Preview file' })
-    map('n', '<leader>or', function() M.show_comment() end, { desc = 'Overleaf: Read comment' })
-    map('n', '<leader>oR', function() M.reply_comment() end, { desc = 'Overleaf: Reply to comment' })
-    map('n', '<leader>ox', function() M.resolve_comment() end, { desc = 'Overleaf: Resolve/reopen comment' })
-    map('n', '<leader>of', function() M.search() end, { desc = 'Overleaf: Find in project' })
-    map('n', '<leader>om', function() M.set_main_file() end, { desc = 'Overleaf: Set main document' })
+function M._set_keymaps()
+  local cfg = config.get()
+  if cfg.keymaps == false then return end
+
+  local prefix = cfg.keymap_prefix
+  for _, km in ipairs(DEFAULT_KEYMAPS) do
+    local suffix, desc, rhs = km[1], km[2], km[3]
+    vim.keymap.set('n', prefix .. suffix, rhs, { desc = 'Overleaf: ' .. desc })
   end
+
+  -- Label the prefix itself so which-key shows "Overleaf" instead of a bare
+  -- key. Optional: the keymaps above work without it.
+  local ok, wk = pcall(require, 'which-key')
+  if ok and type(wk.add) == 'function' then wk.add({ { prefix, group = 'Overleaf' } }) end
 end
 
 function M.connect()

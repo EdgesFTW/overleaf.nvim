@@ -15,6 +15,10 @@ M._config = {
   --   { 'asm', 'c' } - only fileRefs with these extensions (content still checked)
   --   false   - never; fileRefs are download-only, as before
   editable_files = 'auto',
+  -- Every default keymap hangs off this prefix, so the whole set can be moved
+  -- aside when another plugin already claims '<leader>o' (obsidian.nvim, say).
+  keymap_prefix = '<leader>o',
+  keymaps = true, -- false leaves every key free; the :Overleaf commands still work
   log_level = 'info', -- 'debug', 'info', 'warn', 'error'
 }
 

@@ -27,6 +27,7 @@ the original copyright.
 | Editable "binary" files | Overleaf decides doc-vs-file by extension at upload time, so an `.asm`, `.c` or other off-whitelist file is stored as an opaque fileRef even when its content is text, and the web editor refuses to open it. The plugin mirrored such files to disk once and then ignored them: edits there were silently lost and the copy went stale. Text fileRefs are now detected (UTF-8, no NUL bytes, Overleaf's own rule), kept current, opened from the tree, and re-uploaded on save, which Overleaf treats as a replace. See [Files Overleaf stores as binary](#files-overleaf-stores-as-binary). |
 | `:Overleaf upload` works against overleaf.com | Overleaf's upload endpoint takes the file's name from a separate `name` form field and answered every upload with `422 invalid_filename`, so the command had never actually worked. The bridge now sends the field. |
 | Reverting a disk edit is synced | Once an external edit had been synced, restoring the file to the bytes the plugin last wrote itself looked like the plugin's own write echoing back and was dropped, so an undo or revert by an external tool never reached Overleaf. The in-sync state is now updated when an external change is accepted. |
+| Relocatable keymap prefix | Every default key was hardcoded under `<leader>o`, and the documented `keys = false` escape hatch did not work (`opts.keys or true` is always truthy), so a collision with another `<leader>o` plugin could only be resolved by unmapping keys by hand. `keymap_prefix` moves the whole set, `keymaps = false` disables it, and the prefix is labelled in which-key when it is installed. |
 | `env_file` accepts `~` and `$VAR` | `io.open` takes paths literally, so `~/.overleaf.env` was read as a directory named `~` and silently failed. Same intent as unmerged [#23](https://github.com/richwomanbtc/overleaf.nvim/pull/23). |
 
 ### Using this fork
@@ -192,6 +193,11 @@ If you accidentally paste only the value (starting with `s%3A...`), the plugin a
 
 ### Default Keymaps
 
+All of these hang off `keymap_prefix`, `<leader>o` by default. Setting
+`keymap_prefix = '<leader>ol'` moves the whole set to `<leader>olc`,
+`<leader>old` and so on, which is the way out if another plugin already owns
+`<leader>o`. `keymaps = false` registers none of them.
+
 | Key | Description |
 |-----|-------------|
 | `<leader>oc` | Connect |
@@ -204,6 +210,7 @@ If you accidentally paste only the value (starting with `s%3A...`), the plugin a
 | `<leader>oR` | Reply to comment |
 | `<leader>ox` | Resolve/reopen comment |
 | `<leader>of` | Find in project (search) |
+| `<leader>om` | Set main document |
 
 ### Tree Keymaps
 
@@ -242,8 +249,12 @@ require('overleaf').setup({
   -- restricts that to those extensions, false leaves them download-only.
   editable_files = 'auto',
 
-  -- Set to false to disable default keymaps
-  keys = true,
+  -- Prefix every default keymap hangs off. Move it when another plugin already
+  -- claims '<leader>o' -- '<leader>ol' puts the whole set under a free key.
+  keymap_prefix = '<leader>o',
+
+  -- Set to false to disable the default keymaps entirely
+  keymaps = true,
 })
 ```
 
