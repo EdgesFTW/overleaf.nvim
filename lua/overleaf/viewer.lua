@@ -127,4 +127,79 @@ function M.show(pdf_path, page, rects, pid)
   return true, nil
 end
 
+M._monitor_job = nil
+M._monitor_bus = nil
+
+--- The command whose output is watched for Edit signals. A seam for tests,
+--- which have no zathura to click on.
+---@param bus_name string
+---@return table argv
+function M._monitor_command(bus_name) return { 'gdbus', 'monitor', '--session', '--dest', bus_name } end
+
+--- Pick an Edit signal out of a line of `gdbus monitor` output.
+---
+---   /org/pwmt/zathura: org.pwmt.zathura.Edit ('/compile/./main.tex', uint32 71, uint32 4294967295)
+---@param line string
+---@return string|nil file, number|nil line, number|nil column
+function M._parse_edit(line)
+  local file, ln, col = line:match("Edit %('(.-)', uint32 (%d+), uint32 (%d+)%)")
+  if not file then return nil end
+
+  -- SyncTeX reports "no column" as -1, which arrives unsigned.
+  local column = tonumber(col)
+  if column == nil or column >= 2 ^ 31 then column = 0 end
+  return file, tonumber(ln), column
+end
+
+--- Watch a zathura for backward-search clicks.
+---
+--- zathura resolves a ctrl+click through the SyncTeX database sitting next to
+--- the PDF and announces the result as an `Edit` signal, whether or not
+--- `synctex-editor-command` is set. Listening for that is how the plugin learns
+--- about a click at all: there is no signal for a raw one.
+---@param pdf_path string
+---@param pid number|nil
+---@param on_edit fun(file: string, line: number, column: number)
+---@return boolean, string|nil
+function M.watch_edits(pdf_path, pid, on_edit)
+  if M.watching() then return true, nil end
+  if vim.fn.executable('gdbus') == 0 then return false, 'gdbus is needed to watch the viewer' end
+
+  local bus_name = M.find(pdf_path, pid)
+  if not bus_name then return false, 'No zathura is showing ' .. pdf_path end
+
+  local job = vim.fn.jobstart(M._monitor_command(bus_name), {
+    on_stdout = function(_, lines)
+      for _, line in ipairs(lines) do
+        local file, ln, col = M._parse_edit(line)
+        if file then on_edit(file, ln, col) end
+      end
+    end,
+    on_exit = function(id)
+      if M._monitor_job == id then
+        M._monitor_job = nil
+        M._monitor_bus = nil
+      end
+    end,
+  })
+
+  if job <= 0 then return false, 'Could not start gdbus monitor' end
+
+  M._monitor_job = job
+  M._monitor_bus = bus_name
+  config.log('debug', 'Watching %s for SyncTeX clicks', bus_name)
+  return true, nil
+end
+
+---@return boolean
+function M.watching() return M._monitor_job ~= nil end
+
+function M.stop_watching()
+  if M._monitor_job then
+    pcall(vim.fn.jobstop, M._monitor_job)
+    M._monitor_job = nil
+    M._monitor_bus = nil
+  end
+end
+
 return M

@@ -14,6 +14,10 @@ M._config = {
   --   'always' - launch it after every compile (the old behaviour)
   --   false    - never; ':Overleaf pdf' opens it on demand
   pdf_auto_open = 'once',
+  -- Ctrl+click in the PDF jumps the buffer to the line that produced it. Needs
+  -- zathura: it resolves the click against the SyncTeX database the plugin
+  -- downloads next to the PDF, then announces the result on the session bus.
+  inverse_search = true,
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
   -- Files Overleaf stores as binary "fileRefs" (anything whose extension is
   -- not on its text whitelist, e.g. .asm or .c) have no real-time document

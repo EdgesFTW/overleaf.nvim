@@ -49,6 +49,7 @@ M._state = {
   pdf_pid = nil, -- viewer process, when we started it (used to find it on D-Bus)
   build_id = nil, -- the build SyncTeX lookups address
   clsi_server_id = nil, -- CLSI node holding that build
+  synctex_path = nil, -- SyncTeX database mirrored next to the PDF
 }
 
 -- Suffixes appended to config.keymap_prefix. Kept as data so the prefix is the
@@ -1197,6 +1198,42 @@ function M.set_main_file(name)
   end)
 end
 
+--- Fetch the build's SyncTeX database and park it beside the PDF.
+---
+--- zathura finds it by name: for `x.pdf` it reads `x.synctex.gz` from the same
+--- directory. Without it a ctrl+click resolves to nothing and no signal is sent.
+local function fetch_synctex_db(output_files, clsi_server_id, callback)
+  local db = nil
+  for _, f in ipairs(output_files) do
+    if f.path == 'output.synctex.gz' then
+      db = f
+      break
+    end
+  end
+  if not db or not db.url then
+    callback('this build produced no SyncTeX database')
+    return
+  end
+
+  local url = config.get().base_url .. db.url
+  if clsi_server_id then url = url .. '?clsiserverid=' .. clsi_server_id end
+
+  bridge.request('downloadUrl', {
+    cookie = config.get().cookie,
+    url = url,
+    -- Same stem as the PDF, which is what the viewer will look for.
+    fileName = (M._state.project_name or 'output') .. '.synctex.gz',
+    outputDir = config.get().pdf_dir,
+  }, function(err, result)
+    if err then
+      callback(err.message)
+      return
+    end
+    M._state.synctex_path = result.path
+    callback(nil)
+  end)
+end
+
 function M._open_pdf(output_files, clsi_server_id)
   local pdf_file = nil
   for _, f in ipairs(output_files) do
@@ -1227,6 +1264,17 @@ function M._open_pdf(output_files, clsi_server_id)
     end
     M._state.pdf_path = result.path
 
+    if config.get().inverse_search then
+      fetch_synctex_db(output_files, clsi_server_id, function(db_err)
+        if db_err then
+          config.log('debug', 'No inverse search this build: %s', db_err)
+          return
+        end
+        -- A viewer already running can start answering clicks right away.
+        vim.schedule(function() M._start_inverse_search(true) end)
+      end)
+    end
+
     -- The file was replaced in place, so a viewer already showing it has the
     -- new build. Launching it again would only pull focus away from the
     -- buffer, which makes compiling on every :w unusable.
@@ -1239,7 +1287,11 @@ function M._open_pdf(output_files, clsi_server_id)
 
     M._state.pdf_opened[result.path] = true
     config.log('info', 'Opening %s', result.path)
-    vim.schedule(function() M._state.pdf_pid = open_file(result.path) end)
+    vim.schedule(function()
+      M._state.pdf_pid = open_file(result.path)
+      -- The viewer needs a moment to claim its name on the bus.
+      vim.defer_fn(function() M._start_inverse_search() end, 1500)
+    end)
   end)
 end
 
@@ -1255,6 +1307,95 @@ function M.open_pdf()
   M._state.pdf_opened[path] = true
   config.log('info', 'Opening %s', path)
   M._state.pdf_pid = open_file(path)
+end
+
+-- Everything the build compiled lives under this directory inside Overleaf's
+-- container, so the SyncTeX database records project files as
+-- '/compile/./main.tex'. Anything outside it is a TeX Live package.
+local COMPILE_ROOT = '/compile/'
+
+--- Turn a path out of the SyncTeX database into a project path.
+---@param input string
+---@return string|nil nil when it is not a file of this project
+function M._synctex_source_path(input)
+  if type(input) ~= 'string' or input:sub(1, #COMPILE_ROOT) ~= COMPILE_ROOT then return nil end
+
+  local rel = input:sub(#COMPILE_ROOT + 1)
+  rel = rel:gsub('^%./', '')
+  rel = rel:gsub('/%./', '/')
+  if rel == '' then return nil end
+  return rel
+end
+
+--- Put the cursor on `line` of the project file at `path`, opening it first.
+local function jump_to_source(path, line, column)
+  local function place(bufnr)
+    if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return false end
+    local win = vim.fn.bufwinid(bufnr)
+    if win == -1 then
+      vim.api.nvim_set_current_buf(bufnr)
+      win = vim.api.nvim_get_current_win()
+    else
+      vim.api.nvim_set_current_win(win)
+    end
+    local target = math.min(math.max(line, 1), vim.api.nvim_buf_line_count(bufnr))
+    vim.api.nvim_win_set_cursor(win, { target, math.max(column - 1, 0) })
+    vim.cmd('normal! zz')
+    return true
+  end
+
+  local function buffer_for()
+    for _, doc in pairs(M._state.documents) do
+      if doc.path == path then return doc.bufnr end
+    end
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_valid(buf) and vim.b[buf].overleaf_file == path then return buf end
+    end
+    return nil
+  end
+
+  if place(buffer_for()) then return end
+
+  M.open_document(path)
+
+  -- open_document has no completion hook, so wait for the buffer to appear.
+  local attempts = 0
+  local function retry()
+    attempts = attempts + 1
+    if place(buffer_for()) or attempts > 30 then
+      if attempts > 30 then config.log('warn', 'Could not open %s for inverse search', path) end
+      return
+    end
+    vim.defer_fn(retry, 100)
+  end
+  vim.defer_fn(retry, 100)
+end
+
+--- A ctrl+click in the viewer landed on `file`:`line`.
+function M._on_viewer_edit(file, line, column)
+  local path = M._synctex_source_path(file)
+  if not path then
+    config.log('info', 'That part of the PDF comes from %s, which is not in this project', file)
+    return
+  end
+  config.log('info', 'Inverse search: %s:%d', path, line)
+  vim.schedule(function() jump_to_source(path, line, column or 0) end)
+end
+
+--- Start listening for clicks in the viewer, if inverse search is on and there
+--- is a viewer to listen to. Safe to call repeatedly.
+---@param quiet boolean|nil do not warn when there is no viewer yet
+function M._start_inverse_search(quiet)
+  if not config.get().inverse_search then return end
+  if viewer.watching() then return end
+  if not (M._state.pdf_path and M._state.synctex_path) then return end
+
+  local ok, err = viewer.watch_edits(M._state.pdf_path, M._state.pdf_pid, M._on_viewer_edit)
+  if ok then
+    config.log('info', 'Inverse search ready: ctrl+click in the viewer')
+  elseif not quiet then
+    config.log('debug', 'Inverse search not started: %s', err)
+  end
 end
 
 --- The project path of what a buffer is showing: a live document, or a file
@@ -1737,6 +1878,8 @@ function M.disconnect()
   M._state.pdf_pid = nil
   M._state.build_id = nil
   M._state.clsi_server_id = nil
+  M._state.synctex_path = nil
+  viewer.stop_watching()
 
   config.log('info', 'Disconnected')
 end

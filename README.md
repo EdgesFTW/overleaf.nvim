@@ -27,6 +27,7 @@ the original copyright.
 | Editable "binary" files | Overleaf decides doc-vs-file by extension at upload time, so an `.asm`, `.c` or other off-whitelist file is stored as an opaque fileRef even when its content is text, and the web editor refuses to open it. The plugin mirrored such files to disk once and then ignored them: edits there were silently lost and the copy went stale. Text fileRefs are now detected (UTF-8, no NUL bytes, Overleaf's own rule), kept current, opened from the tree, and re-uploaded on save, which Overleaf treats as a replace. See [Files Overleaf stores as binary](#files-overleaf-stores-as-binary). |
 | `:Overleaf upload` works against overleaf.com | Overleaf's upload endpoint takes the file's name from a separate `name` form field and answered every upload with `422 invalid_filename`, so the command had never actually worked. The bridge now sends the field. |
 | Reverting a disk edit is synced | Once an external edit had been synced, restoring the file to the bytes the plugin last wrote itself looked like the plugin's own write echoing back and was dropped, so an undo or revert by an external tool never reached Overleaf. The in-sync state is now updated when an external change is accepted. |
+| Inverse search (SyncTeX) | Ctrl+click in the PDF jumps the buffer to the line that produced it — the feature Overleaf's web editor has and this plugin did not. The server-side lookup cannot carry this direction, since nothing reports a raw click, so the build's SyncTeX database is mirrored next to the PDF and zathura's `Edit` signal is watched instead. See [SyncTeX inverse search](#synctex-inverse-search). |
 | Forward search (SyncTeX) | Overleaf's own double-click-to-PDF has no equivalent here: the plugin could compile but not say where the cursor landed. `:Overleaf forward` now asks Overleaf where a line ended up and moves the viewer there, highlighting the box. See [SyncTeX forward search](#synctex-forward-search). |
 | Compiling does not steal focus | Every compile relaunched the PDF viewer, so the window manager pulled focus away from Neovim — which makes compiling on `:w` unusable. The output is written to the same path on every build, so a viewer that reloads on change is already current; `pdf_auto_open` now launches it for the first compile only by default, and downloads are staged through a sibling file and renamed so a watching viewer never reads a half-written PDF. |
 | Relocatable keymap prefix | Every default key was hardcoded under `<leader>o`, and the documented `keys = false` escape hatch did not work (`opts.keys or true` is always truthy), so a collision with another `<leader>o` plugin could only be resolved by unmapping keys by hand. `keymap_prefix` moves the whole set, `keymaps = false` disables it, and the prefix is labelled in which-key when it is installed. |
@@ -256,6 +257,10 @@ require('overleaf').setup({
   -- Forward search drives the viewer over D-Bus, which only zathura supports.
   pdf_viewer = 'zathura',
 
+  -- Ctrl+click in the PDF jumps the buffer to the line behind it. Set false to
+  -- skip downloading the SyncTeX database and watching the viewer.
+  inverse_search = true,
+
   -- Local file sync directory for external tools like Claude Code (default: nil = disabled)
   -- When set, all documents are mirrored to disk and external changes are synced back.
   sync_dir = '~/.overleaf',
@@ -382,9 +387,28 @@ Some notes on what it can and cannot do:
 - Overleaf evicts old builds. Once that happens the lookup 404s and the plugin asks
   for a recompile.
 
-Inverse search (click in the PDF, jump to the source) is not implemented: it needs
-the SyncTeX database next to the PDF so zathura can resolve a click locally, which
-is a different mechanism from the server-side lookup used here.
+## SyncTeX inverse search
+
+Ctrl+click anywhere in the PDF and the buffer jumps to the line that produced it,
+opening the document first if it is not already loaded.
+
+This runs on a different mechanism from forward search. There is no signal for a
+raw click, so the plugin cannot ask Overleaf where one landed; zathura will only
+report a click after resolving it itself. So each compile also downloads the
+build's `output.synctex.gz` next to the PDF, under the stem the viewer looks for
+(`x.pdf` → `x.synctex.gz`). zathura resolves the click against it and announces
+the result as an `Edit` signal on the session bus, which the plugin watches with
+`gdbus monitor`.
+
+The database records project files by their path inside Overleaf's build
+container, `/compile/./main.tex`, so the prefix is stripped to get back to
+`main.tex`. A click that lands in a TeX Live package rather than your own source
+is reported and otherwise ignored — there is no local file to open.
+
+Set `inverse_search = false` to skip the download and the watcher.
+
+Caveats are the same as forward search's: it answers for the last compile, and
+the modifier is zathura's own `synctex-edit-modifier`, ctrl by default.
 
 ### Usage with Claude Code
 
