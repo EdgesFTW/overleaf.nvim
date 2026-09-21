@@ -1,5 +1,6 @@
 local bridge = require('overleaf.bridge')
 local config = require('overleaf.config')
+local ot = require('overleaf.ot')
 
 local M = {}
 
@@ -66,7 +67,7 @@ function M.parse_ranges(doc_id, ranges)
       table.insert(M._doc_comments[doc_id], {
         threadId = op.t,
         offset = op.p or 0, -- character offset in document
-        length = op.c and #op.c or 0,
+        length = op.c and ot.utf8_len(op.c) or 0,
         content = op.c or '',
       })
       config.log(
@@ -74,35 +75,78 @@ function M.parse_ranges(doc_id, ranges)
         'Comment: thread=%s offset=%d len=%d text="%s"',
         op.t,
         op.p or 0,
-        op.c and #op.c or 0,
+        op.c and ot.utf8_len(op.c) or 0,
         (op.c or ''):sub(1, 30)
       )
     end
   end
 end
 
---- Convert a character offset to line/col in a buffer
+--- Convert a character offset to a 1-based line and a 0-based BYTE column.
+--- Overleaf counts characters; Neovim addresses text by byte, so a multibyte
+--- character before the offset must not be read as several.
 local function offset_to_pos(content, offset)
-  local line = 1
-  local col = 0
-  local pos = 0
-  for i = 1, #content do
-    if pos >= offset then return line, col end
-    if content:sub(i, i) == '\n' then
-      line = line + 1
-      col = 0
-    else
-      col = col + 1
-    end
-    pos = pos + 1
+  local byte = ot.char_to_byte(content, math.max(offset, 0))
+  local line, line_start = 1, 0
+  local pos = content:find('\n', 1, true)
+  while pos and pos <= byte do
+    line = line + 1
+    line_start = pos
+    pos = content:find('\n', pos + 1, true)
   end
-  return line, col
+  return line, byte - line_start
+end
+
+--- Character offset of a buffer position (0-based row, byte column).
+local function pos_to_offset(bufnr, row, col)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, row + 1, false)
+  local byte = 0
+  for i = 1, row do
+    byte = byte + #(lines[i] or '') + 1
+  end
+  byte = byte + col
+  local text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  return ot.byte_to_char(text, math.min(byte, #text))
+end
+
+--- The highlight extmarks are what actually follow the text as it is edited, so
+--- they, not the offsets recorded at join time, say where each comment is now.
+--- Copy their positions back before anything reads the offsets. A comment whose
+--- text was deleted has collapsed to nothing, as the server treats it: dropped.
+---@param bufnr number
+---@param doc_id string
+local function refresh_from_marks(bufnr, doc_id)
+  local list = M._doc_comments[doc_id]
+  if not list or not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+
+  local kept = {}
+  for _, c in ipairs(list) do
+    if not c.mark then
+      table.insert(kept, c)
+    else
+      local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, M._ns, c.mark, { details = true })
+      if m and #m > 0 and m[3] and m[3].end_row then
+        local from = pos_to_offset(bufnr, m[1], m[2])
+        local to = pos_to_offset(bufnr, m[3].end_row, m[3].end_col)
+        if to > from then
+          c.offset = from
+          c.length = to - from
+          table.insert(kept, c)
+        end
+      end
+      -- else: the mark is gone or empty; the comment no longer covers any text.
+    end
+  end
+  M._doc_comments[doc_id] = kept
 end
 
 --- Render comment markers on a buffer using extmarks
 function M.render(bufnr, doc_id, content)
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
 
+  -- Positions recorded at join time go stale with every edit; read them back
+  -- from the marks before the marks are rebuilt from them.
+  refresh_from_marks(bufnr, doc_id)
   vim.api.nvim_buf_clear_namespace(bufnr, M._ns, 0, -1)
 
   local comments = M._doc_comments[doc_id]
@@ -144,9 +188,10 @@ function M.render(bufnr, doc_id, content)
       table.insert(line_labels[start_line], label)
 
       -- Highlight the range (each comment gets its own highlight)
+      c.mark = nil
       pcall(
         function()
-          vim.api.nvim_buf_set_extmark(bufnr, M._ns, start_line - 1, start_col, {
+          c.mark = vim.api.nvim_buf_set_extmark(bufnr, M._ns, start_line - 1, start_col, {
             end_row = end_line - 1,
             end_col = end_col,
             hl_group = 'OverleafComment',
@@ -174,20 +219,16 @@ end
 
 --- Get comment thread at cursor position
 function M.get_thread_at_cursor(doc_id, _content)
+  local bufnr = vim.api.nvim_get_current_buf()
   local cursor = vim.api.nvim_win_get_cursor(0)
-  local cursor_line = cursor[1]
-  local cursor_col = cursor[2]
+
+  -- Where each comment is NOW, not where it was when the document was joined.
+  refresh_from_marks(bufnr, doc_id)
 
   local comments = M._doc_comments[doc_id]
   if not comments then return nil end
 
-  -- Convert cursor position to character offset
-  local lines = vim.api.nvim_buf_get_lines(0, 0, cursor_line, false)
-  local offset = 0
-  for i = 1, #lines - 1 do
-    offset = offset + #lines[i] + 1 -- +1 for newline
-  end
-  offset = offset + cursor_col
+  local offset = pos_to_offset(bufnr, cursor[1] - 1, cursor[2])
 
   for _, c in ipairs(comments) do
     if offset >= c.offset and offset <= c.offset + c.length then

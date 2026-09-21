@@ -27,6 +27,9 @@ the original copyright.
 | Editable "binary" files | Overleaf decides doc-vs-file by extension at upload time, so an `.asm`, `.c` or other off-whitelist file is stored as an opaque fileRef even when its content is text, and the web editor refuses to open it. The plugin mirrored such files to disk once and then ignored them: edits there were silently lost and the copy went stale. Text fileRefs are now detected (UTF-8, no NUL bytes, Overleaf's own rule), kept current, opened from the tree, and re-uploaded on save, which Overleaf treats as a replace. See [Files Overleaf stores as binary](#files-overleaf-stores-as-binary). |
 | `:Overleaf upload` works against overleaf.com | Overleaf's upload endpoint takes the file's name from a separate `name` form field and answered every upload with `422 invalid_filename`, so the command had never actually worked. The bridge now sends the field. |
 | Reverting a disk edit is synced | Once an external edit had been synced, restoring the file to the bytes the plugin last wrote itself looked like the plugin's own write echoing back and was dropped, so an undo or revert by an external tool never reached Overleaf. The in-sync state is now updated when an external change is accepted. |
+| Comments and suggestions survive external edits | A file rewritten on disk reached Overleaf as "delete the whole document, type it back" (a closed doc) or "delete everything between the first and last change" (an open one). Overleaf drops a comment or suggestion anchored to any text an op deletes, even when it is put straight back, so one changed word wiped every anchor in the file — the comment collapsed to an empty range, suggested insertions vanished and suggested deletions were displaced to the end. Changes are now diffed by word and only the words that differ are touched. See [Comments and suggestions](#comments-and-suggestions). |
+| Editing / suggesting / viewing modes | The client could only edit outright. `:Overleaf mode` adds Overleaf's other two: **suggesting** sends every edit as a tracked change, and **viewing** is read-only and sends nothing — from the buffer or from the disk mirror. Modes the server would reject (a reviewer's plain edits, a read-only collaborator) are never offered, and a project that forces tracking on for you is respected. See [Modes](#modes). |
+| Comment highlights follow the text | Highlight and "read comment at cursor" positions were recorded once at join and never updated, so after any edit above a comment the highlight drifted, the thread was no longer found under the cursor, and in text with accents the offsets (characters) were read as bytes. Positions are now read back from the extmarks that track the text. |
 | Inverse search (SyncTeX) | Ctrl+click in the PDF jumps the buffer to the line that produced it — the feature Overleaf's web editor has and this plugin did not. The server-side lookup cannot carry this direction, since nothing reports a raw click, so the build's SyncTeX database is mirrored next to the PDF and zathura's `Edit` signal is watched instead. See [SyncTeX inverse search](#synctex-inverse-search). |
 | Forward search (SyncTeX) | Overleaf's own double-click-to-PDF has no equivalent here: the plugin could compile but not say where the cursor landed. `:Overleaf forward` now asks Overleaf where a line ended up and moves the viewer there, highlighting the box. See [SyncTeX forward search](#synctex-forward-search). |
 | Compiling does not steal focus | Every compile relaunched the PDF viewer, so the window manager pulled focus away from Neovim — which makes compiling on `:w` unusable. The output is written to the same path on every build, so a viewer that reloads on change is already current; `pdf_auto_open` now launches it for the first compile only by default, and downloads are staged through a sibling file and renamed so a watching viewer never reads a half-written PDF. |
@@ -183,6 +186,7 @@ If you accidentally paste only the value (starting with `s%3A...`), the plugin a
 | `:Overleaf preview` | Open a binary file (image, PDF) in an external viewer |
 | `:Overleaf pdf` | Open the last compiled PDF in the viewer |
 | `:Overleaf forward` | Move the viewer to the cursor's position in the PDF (SyncTeX) |
+| `:Overleaf mode [name]` | Switch between `editing`, `suggesting` and `viewing`; with no argument, pick from a list |
 | `:Overleaf new [name]` | Create new document |
 | `:Overleaf mkdir [name]` | Create new folder |
 | `:Overleaf delete` | Delete file/folder |
@@ -218,6 +222,7 @@ All of these hang off `keymap_prefix`, `<leader>o` by default. Setting
 | `<leader>om` | Set main document |
 | `<leader>ov` | View the compiled PDF |
 | `<leader>os` | Forward search: move the viewer to the cursor |
+| `<leader>oM` | Switch mode (editing / suggesting / viewing) |
 
 ### Tree Keymaps
 
@@ -256,6 +261,13 @@ require('overleaf').setup({
 
   -- Forward search drives the viewer over D-Bus, which only zathura supports.
   pdf_viewer = 'zathura',
+
+  -- How this client changes the project, as in Overleaf's editor:
+  --   'auto' (default) - editing where the project allows it, else the nearest mode
+  --   'editing'        - edits are applied as typed
+  --   'suggesting'     - edits are sent as tracked changes (suggestions)
+  --   'viewing'        - read-only; nothing is sent
+  mode = 'auto',
 
   -- Ctrl+click in the PDF jumps the buffer to the line behind it. Set false to
   -- skip downloading the SyncTeX database and watching the viewer.
@@ -357,6 +369,76 @@ whitelisted extension (`main.asm.txt`); it becomes a document and
 Set `editable_files = false` to restore the old download-only behaviour, or
 give a list of extensions to limit which fileRefs are treated this way.
 
+### Usage with Claude Code
+
+```bash
+# Start Claude Code in the sync directory
+cd ~/.overleaf/My\ Project
+claude
+```
+
+Claude Code can now read all your LaTeX files and make edits that sync back to Overleaf in real-time.
+
+## Modes
+
+The same three modes as Overleaf's editor. Switch with `:Overleaf mode <name>`,
+`<leader>oM`, or `mode = '...'` in `setup()`.
+
+| Mode | What happens to an edit |
+|---|---|
+| `editing` | Applied as typed. The default. |
+| `suggesting` | Sent as a **tracked change**: a suggestion the owner can accept or reject in Overleaf, anchored where you made it. |
+| `viewing` | Nothing is sent. Buffers are read-only and changes to the disk mirror are held back, not pushed. |
+
+- **It covers external tools too.** With `sync_dir` set, an edit made to the mirror
+  by another program follows the current mode. `suggesting` plus Claude Code, a
+  formatter or a script means their changes arrive as suggestions to review rather
+  than as edits already applied.
+- **Comments work in every mode**, as they do on the web: you can read, reply to
+  and resolve them while viewing.
+- **Only what the server allows is offered.** A `review` collaborator's plain edits
+  are rejected by Overleaf, so they start in `suggesting` and cannot enter
+  `editing`; a `readOnly` one is limited to `viewing`. If the project has tracking
+  switched on for you, edits have to be suggestions (an owner is not bound by
+  tracking they turned on for others).
+- **Switching sends what you typed first**, so an edit goes out under the mode it
+  was typed in.
+- **Held changes.** Disk edits made while viewing are kept, not dropped. Leaving
+  viewing tells you how many are waiting; `:Overleaf sync import` sends them.
+- **A file replaced whole cannot be a suggestion.** Text Overleaf stores as a binary
+  file (see [below](#files-overleaf-stores-as-binary)) is saved by re-uploading it,
+  which is only done while `editing`.
+- Structural changes (new, rename, delete, upload, main document) are refused while
+  viewing.
+
+`require('overleaf').statusline()` appends the mode when it is not the default:
+`OL: Thesis / main.tex [suggesting]`.
+
+Not implemented: suggestions are sent but not drawn. A suggested deletion is not in
+the buffer at all (Overleaf stores the text on the side) and a suggested insertion
+looks like ordinary text, so review and accept or reject in Overleaf. The mode is
+this client's own — it does not move the web editor's Reviewing switch — and a
+change to the project's tracking settings made while you are connected is noticed
+on the next connect.
+
+## Comments and suggestions
+
+Overleaf anchors comments and suggestions to ranges of text. Any op that *deletes*
+text an anchor covers removes it, even if the same text is typed straight back. So
+an edit is sent as the words that changed and nothing more:
+
+- an external rewrite of the mirror — open document or not — touches only the
+  differing words, so a comment on the paragraph in between is undisturbed;
+- a reflow that only moves whitespace touches no word at all;
+- while `suggesting`, a replaced word is replaced whole (`lazy` struck out,
+  `sleepy` added) rather than as `laz` → `sleep`; in `editing` the smallest edit is
+  sent, which keeps an anchor on the surviving part of a word.
+
+What still removes an anchor is what removes it on the web: deleting or replacing
+all of the commented text.
+
+Highlights and "read comment at cursor" follow the text as it is edited.
+
 ## SyncTeX forward search
 
 `:Overleaf forward` (`<leader>os`) moves the PDF viewer to whatever the cursor is
@@ -410,15 +492,60 @@ Set `inverse_search = false` to skip the download and the watcher.
 Caveats are the same as forward search's: it answers for the last compile, and
 the modifier is zathura's own `synctex-edit-modifier`, ctrl by default.
 
-### Usage with Claude Code
+## Testing status and known gaps
 
-```bash
-# Start Claude Code in the sync directory
-cd ~/.overleaf/My\ Project
-claude
-```
+Written down so nothing here is trusted further than it was tested. This is a
+maintenance fork, not a released product, and several of the features above have
+only been exercised by one person against one project.
 
-Claude Code can now read all your LaTeX files and make edits that sync back to Overleaf in real-time.
+**Checked against real Overleaf** (a scratch project owned by the tester, no other
+collaborators, throwaway documents deleted afterwards):
+
+- an external rewrite of an open and of a closed document keeps a comment and both
+  a suggested insertion and a suggested deletion, at the right shifted positions,
+  where the previous code lost them;
+- `suggesting` produces tracked insertions and deletions, `editing` produces plain
+  edits, `viewing` sends nothing, and a change held while viewing arrives as a plain
+  edit afterwards;
+- the SyncTeX lookups behind forward search, and forward search moving a real
+  zathura to the right page.
+
+**Checked only by unit tests and a mock server** (so only as reliable as the mock):
+
+- the diff itself, including a randomized property test — it is compared against the
+  text it should produce, and falls back to one coarse hunk if it ever does not;
+- the mode policy, the read-only guarantees, the disk-mirror guards, and the `meta`
+  the bridge attaches to a tracked update.
+
+**Not checked at all:**
+
+- **Any access level other than owner.** That a `review` collaborator's plain edits
+  are rejected, and that a `readOnly` one cannot send, comes from reading Overleaf's
+  source, not from trying it. The mode policy is built on that reading.
+- **Forced tracking.** How the server reports "track changes is on for you"
+  (`trackChangesState`, a boolean or a per-user map) was read from source and the
+  test project has it empty, so the rule that binds a collaborator to `suggesting`
+  has never been seen firing on a real project. A change to it made while you are
+  connected is not noticed.
+- **More than one person editing.** Nothing was tested with another collaborator
+  editing at the same moment. A bulk change is sent as several hunks in descending
+  order so that concurrent edits transform correctly, which holds by construction
+  and in unit tests, not against a live second client.
+- **Characters outside the Basic Multilingual Plane** (emoji and the like). Overleaf
+  counts positions in UTF-16 units, the plugin in characters, and the content hash
+  the bridge sends is computed from the JavaScript string. Accented text was
+  tested; emoji was not.
+- **Anything but the smallest case for suggestions.** Whole-word replacement was
+  checked on one word. Interleaved suggestions from several people, undo history
+  across a mode switch, and very large rewrites are untested.
+- **Inverse search's physical ctrl+click.** The database download, the watcher and
+  the jump from a genuine `Edit` signal are tested; a real click was not, because
+  synthetic input stopped reaching zathura's window.
+- **Lint.** `luacheck` was not run for this round of changes.
+
+Treat the mode and suggestion behaviour as a first pass. If a suggestion looks
+wrong in Overleaf, or a comment moves unexpectedly, that is a bug worth reporting
+with the before and after text.
 
 ## How It Works
 

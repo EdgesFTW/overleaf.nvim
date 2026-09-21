@@ -180,12 +180,12 @@ const handlers = {
   },
 
   async applyOtUpdate(params) {
-    const { docId, op, v, content } = params;
+    const { docId, op, v, content, tracked } = params;
     if (!socketManager) throw { code: 'NOT_CONNECTED', message: 'Not connected to a project' };
     if (!docId || op === undefined || v === undefined) {
       throw { code: 'MISSING_PARAM', message: 'docId, op, and v are required' };
     }
-    return await socketManager.applyOtUpdate(docId, op, v, content);
+    return await socketManager.applyOtUpdate(docId, op, v, content, tracked === true);
   },
 
   async compile(params) {

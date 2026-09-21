@@ -372,7 +372,7 @@ describe('sync', function()
   end)
 
   describe('disk edit of a closed doc', function()
-    it('is sent to Overleaf as a delete-all/insert-all OT op', function()
+    it('is sent to Overleaf as an OT op', function()
       local calls = {}
       bridge.request = fake_bridge({}, calls, { doc_lines = { 'old' }, doc_version = 7 })
       local doc = Document.new('doc_main', 'main.tex')
@@ -393,6 +393,33 @@ describe('sync', function()
       assert.are.same({ { p = 0, d = 'old' }, { p = 0, i = 'new text' } }, update.op)
       assert.are.equal('new text', doc.content)
       assert.are.equal(1, #calls_of(calls, 'leaveDoc'))
+    end)
+
+    -- Overleaf drops a comment or suggestion anchored to any text an op deletes,
+    -- even when the text is put straight back. Deleting the whole document to
+    -- change two words wiped every anchor in it.
+    it('touches only the words that changed, so comments and suggestions survive', function()
+      local text = 'alpha line\nThe quick brown fox jumps over the lazy dog.\nomega line'
+      local calls = {}
+      bridge.request = fake_bridge({}, calls, { doc_lines = vim.split(text, '\n', { plain = true }), doc_version = 7 })
+      local doc = Document.new('doc_main', 'main.tex')
+      doc.content = text
+      doc.server_content = text
+      doc.version = 7
+      sync.write_doc(doc)
+      sync.watch(doc)
+      local path = tmpdir .. '/Test Project/main.tex'
+
+      write_file(path, (text:gsub('alpha', 'ALPHA'):gsub('omega', 'OMEGA')))
+      assert.is_true(vim.wait(5000, function() return #calls_of(calls, 'applyOtUpdate') > 0 end))
+
+      local op = calls_of(calls, 'applyOtUpdate')[1].params.op
+      assert.are.same({
+        { p = 56, d = 'omega' },
+        { p = 56, i = 'OMEGA' },
+        { p = 0, d = 'alpha' },
+        { p = 0, i = 'ALPHA' },
+      }, op)
     end)
 
     it('sends a revert to the originally written bytes', function()

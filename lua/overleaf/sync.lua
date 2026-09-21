@@ -2,6 +2,8 @@
 --- Mirrors Overleaf documents to disk and watches for external changes.
 local config = require('overleaf.config')
 local bridge = require('overleaf.bridge')
+local diff = require('overleaf.diff')
+local mode = require('overleaf.mode')
 
 local M = {}
 
@@ -30,6 +32,7 @@ M._file_watchers = {} -- disk path -> fs_event handle
 M._file_timers = {} -- disk path -> debounce timer
 M._last_uploaded = {} -- disk path -> the exact bytes last sent to Overleaf
 M._uploading = {} -- disk path -> bytes of an upload in flight (so the watcher does not resend them)
+M._held = {} -- disk path -> true: changed on disk while the mode forbade sending it
 
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
@@ -72,6 +75,7 @@ function M.stop()
   M._files = {}
   M._last_uploaded = {}
   M._uploading = {}
+  M._held = {}
 
   M._sync_dir = nil
 end
@@ -202,6 +206,26 @@ function M.unwatch(doc)
   end
 end
 
+--- Remember a disk change the current mode would not let us send. It is kept,
+--- not dropped, so leaving the mode can say how much is waiting.
+---@param path string
+---@param what string
+local function hold(path, what)
+  if not M._held[path] then
+    config.log('warn', 'Not sending %s to Overleaf in %s mode: it changed on disk', what, mode.get())
+  end
+  M._held[path] = true
+end
+
+---@return number
+function M.held_count()
+  local n = 0
+  for _ in pairs(M._held) do
+    n = n + 1
+  end
+  return n
+end
+
 --- Handle external file change
 ---@param path string local file path
 ---@param doc table Document instance
@@ -219,6 +243,13 @@ function M._on_file_changed(path, doc)
   -- document has moved on since.
   if new_content == M._last_written[path] then return end
 
+  -- Read-only: leave the file as the external tool wrote it and send nothing.
+  if not mode.writable() then
+    hold(path, doc.path)
+    return
+  end
+  M._held[path] = nil
+
   -- Guard: reject empty content when document has existing data.
   -- Prevents truncated file reads (race with external writes) from wiping the buffer.
   if #new_content == 0 and doc.content and #doc.content > 0 then
@@ -234,9 +265,9 @@ function M._on_file_changed(path, doc)
   M._last_written[path] = new_content
 
   if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-    -- Doc is open in Neovim: replace buffer content (triggers on_bytes → OT → server)
-    local lines = vim.split(new_content, '\n', { plain = true })
-    vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, lines)
+    -- Doc is open in Neovim: change only what differs (triggers on_lines → OT →
+    -- server), so comment highlights on the untouched text stay where they are.
+    require('overleaf.buffer').replace_content(doc.bufnr, new_content)
   else
     -- Doc is NOT open: join, send OT ops directly, leave
     M._sync_closed_doc(doc, new_content)
@@ -262,16 +293,17 @@ function M._sync_closed_doc(doc, new_content)
       return
     end
 
-    -- Build OT ops: delete all, then insert all
-    local ops = {}
-    if #server_content > 0 then table.insert(ops, { p = 0, d = server_content }) end
-    if #new_content > 0 then table.insert(ops, { p = 0, i = new_content }) end
+    -- Only the words that differ. Deleting the whole document and typing it
+    -- back would wipe every comment and suggestion in it, because Overleaf drops
+    -- those anchored to any text an op deletes.
+    local ops = diff.ops(server_content, new_content, 0, { words = mode.tracked() })
 
     bridge.request('applyOtUpdate', {
       docId = doc.doc_id,
       op = ops,
       v = version,
       content = server_content,
+      tracked = require('overleaf.mode').tracked(),
     }, function(ot_err, _)
       if ot_err then
         config.log('error', 'Sync OT failed for %s: %s', doc.path, ot_err.message)
@@ -598,6 +630,14 @@ function M.upload_file(entry, local_path, data, callback)
     return
   end
 
+  -- Replacing a file wholesale cannot be a suggestion, and viewing sends nothing.
+  if not mode.can_replace_files() then
+    hold(local_path, entry.path)
+    callback({ code = 'MODE', message = 'Not sent in ' .. mode.get() .. ' mode' })
+    return
+  end
+  M._held[local_path] = nil
+
   data = data or read_bytes(local_path)
   if data then M._uploading[local_path] = data end
   config.log('info', 'Uploading %s...', entry.path)
@@ -739,6 +779,7 @@ function M.import_all(state)
     config.log('warn', 'File sync not enabled (set sync_dir in config)')
     return
   end
+  if not mode.require_write('importing changed files') then return end
 
   local changed = 0
   for _, doc in pairs(state.documents) do
@@ -751,8 +792,7 @@ function M.import_all(state)
       if disk_content ~= doc.content then
         changed = changed + 1
         if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-          local lines = vim.split(disk_content, '\n', { plain = true })
-          vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, lines)
+          require('overleaf.buffer').replace_content(doc.bufnr, disk_content)
         else
           M._sync_closed_doc(doc, disk_content)
         end

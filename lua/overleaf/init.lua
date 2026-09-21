@@ -5,6 +5,7 @@ local Document = require('overleaf.document')
 local buffer = require('overleaf.buffer')
 local sync = require('overleaf.sync')
 local viewer = require('overleaf.viewer')
+local mode = require('overleaf.mode')
 
 local M = {}
 
@@ -44,6 +45,7 @@ M._state = {
   csrf_token = nil,
   root_doc_id = nil, -- project's main document; Overleaf compiles this one
   documents = {}, -- doc_id -> Document
+  user_id = nil, -- the signed-in user's id, for per-user project settings
   pdf_path = nil, -- where the last compile's output.pdf landed
   pdf_opened = {}, -- path -> true once a viewer has been launched for it
   pdf_pid = nil, -- viewer process, when we started it (used to find it on D-Bus)
@@ -68,6 +70,7 @@ local DEFAULT_KEYMAPS = {
   { 'm', 'Set main document', function() M.set_main_file() end },
   { 'v', 'View PDF', function() M.open_pdf() end },
   { 's', 'Forward search (SyncTeX)', function() M.forward_search() end },
+  { 'M', 'Switch mode (editing/suggesting/viewing)', function() M.select_mode() end },
 }
 
 function M.setup(opts)
@@ -123,6 +126,7 @@ function M.connect()
 
         config.log('info', 'Authenticated as %s (%d projects)', result.userEmail or result.userId, #result.projects)
         M._state.csrf_token = result.csrfToken
+        M._state.user_id = result.userId
         project.set_projects(result.projects)
 
         -- Step 4: Select project
@@ -207,6 +211,11 @@ function M._connect_project(cookie, project_id, project_name)
     M._state.project_name = project_name
     M._state.project_data = result.project
     M._state.root_doc_id = result.project and result.project.rootDoc_id or nil
+
+    -- What this session may do depends on the access level the server granted
+    -- and on whether the project forces tracking on for this user.
+    mode.init(result.permissionsLevel, result.project and result.project.trackChangesState, M._state.user_id)
+    if mode.get() ~= mode.EDITING then config.log('info', 'Mode: %s (%s)', mode.get(), M._mode_note(mode.get())) end
 
     -- Parse project tree
     project.parse_project_tree(result.project)
@@ -316,7 +325,10 @@ function M._setup_event_handlers()
             if old_doc.bufnr and vim.api.nvim_buf_is_valid(old_doc.bufnr) then
               vim.schedule(function()
                 old_doc.applying_remote = true
-                vim.api.nvim_buf_set_lines(old_doc.bufnr, 0, -1, false, result.lines)
+                buffer.unlocked(
+                  old_doc.bufnr,
+                  function() vim.api.nvim_buf_set_lines(old_doc.bufnr, 0, -1, false, result.lines) end
+                )
                 vim.bo[old_doc.bufnr].modified = false
                 old_doc.applying_remote = false
 
@@ -612,6 +624,7 @@ function M.open_document(doc_id_or_path, doc_path)
     end
 
     buffer.create(doc, lines)
+    if not mode.writable() then vim.bo[doc.bufnr].modifiable = false end
 
     -- Write to sync dir and start watching for external changes
     sync.write_doc(doc)
@@ -663,12 +676,23 @@ function M.open_file_entry(entry, opts)
       vim.cmd('edit ' .. vim.fn.fnameescape(local_path))
       local bufnr = vim.api.nvim_get_current_buf()
       vim.b[bufnr].overleaf_file = entry.path
+      if not mode.writable() then vim.bo[bufnr].modifiable = false end
 
       -- :w uploads directly (the watcher skips bytes already in flight) so the
       -- compile can follow the upload, as it follows the OT flush for docs.
       vim.api.nvim_create_autocmd('BufWritePost', {
         buffer = bufnr,
         callback = function()
+          -- Replacing a file wholesale cannot be a suggestion.
+          if not mode.can_replace_files() then
+            config.log(
+              'warn',
+              '%s is stored as a file on Overleaf, so saving replaces it outright and cannot be a suggestion; not sent in %s mode',
+              entry.name,
+              mode.get()
+            )
+            return
+          end
           sync.upload_file(entry, local_path, nil, function(upload_err)
             if not upload_err then M.compile() end
           end)
@@ -759,6 +783,7 @@ function M.create_doc(name, parent_folder_id)
     config.log('warn', 'Not connected.')
     return
   end
+  if not mode.require_write('creating a document') then return end
 
   local prefix = project.get_folder_path(parent_folder_id)
 
@@ -824,6 +849,7 @@ function M.create_folder(name, parent_folder_id)
     config.log('warn', 'Not connected.')
     return
   end
+  if not mode.require_write('creating a folder') then return end
 
   local prefix = project.get_folder_path(parent_folder_id)
 
@@ -906,6 +932,7 @@ function M.upload_file(file_path, parent_folder_id)
     config.log('warn', 'Not connected.')
     return
   end
+  if not mode.require_write('uploading a file') then return end
 
   local function do_upload(path)
     if not path or path == '' then return end
@@ -954,6 +981,7 @@ function M.rename_entity()
     config.log('warn', 'Not connected.')
     return
   end
+  if not mode.require_write('renaming') then return end
 
   -- Show entries to rename
   local entries = {}
@@ -1004,6 +1032,7 @@ function M.delete_entity()
     config.log('warn', 'Not connected.')
     return
   end
+  if not mode.require_write('deleting') then return end
 
   -- Show deletable entries
   local entries = {}
@@ -1150,6 +1179,7 @@ function M.set_main_file(name)
     config.log('warn', 'Not connected. Run :Overleaf connect first.')
     return
   end
+  if not mode.require_write('changing the main document') then return end
 
   local candidates = {}
   for _, e in ipairs(project._project_tree) do
@@ -1880,8 +1910,109 @@ function M.disconnect()
   M._state.clsi_server_id = nil
   M._state.synctex_path = nil
   viewer.stop_watching()
+  mode.reset()
 
   config.log('info', 'Disconnected')
+end
+
+local MODE_NOTES = {
+  editing = 'edits are applied as typed',
+  suggesting = 'edits are sent as suggestions',
+  viewing = 'read-only, nothing is sent',
+}
+
+---@param name string
+---@return string
+function M._mode_note(name) return MODE_NOTES[name] or '' end
+
+--- Lock or unlock every buffer the plugin shows for the current mode.
+function M._apply_mode_to_buffers()
+  local writable = mode.writable()
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then vim.bo[doc.bufnr].modifiable = writable end
+  end
+  -- Files opened out of the mirror (text stored as binary on Overleaf).
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.b[buf].overleaf_file then vim.bo[buf].modifiable = writable end
+  end
+end
+
+mode.on_change(function() M._apply_mode_to_buffers() end)
+
+--- Send everything typed so far, so it goes out under the mode it was typed in.
+--- A suggestion is decided per update; edits still queued when the mode flips
+--- would otherwise be sent under the new one.
+---@param timeout_ms number
+---@return boolean drained
+function M._drain_edits(timeout_ms)
+  local docs = vim.tbl_values(M._state.documents)
+  for _, doc in ipairs(docs) do
+    buffer.reconcile(doc)
+    doc:flush()
+  end
+
+  local function idle()
+    for _, doc in ipairs(docs) do
+      if doc.inflight_op or doc.pending_ops or buffer.has_pending(doc) then return false end
+    end
+    return true
+  end
+  return vim.wait(timeout_ms, idle, 20)
+end
+
+--- Switch between editing, suggesting and viewing.
+---@param name string
+---@return boolean ok
+function M.set_mode(name)
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    return false
+  end
+
+  local refusal = mode.refusal(name)
+  if refusal then
+    config.log('warn', '%s', refusal)
+    return false
+  end
+  if name == mode.get() then
+    config.log('info', 'Already in %s mode', name)
+    return true
+  end
+
+  if not M._drain_edits(3000) then
+    config.log('warn', 'Still sending edits; try again in a moment')
+    return false
+  end
+
+  local was_viewing = mode.get() == mode.VIEWING
+  mode.set(name)
+  config.log('info', 'Mode: %s (%s)', name, M._mode_note(name))
+
+  -- Disk edits made while viewing were held back, not lost.
+  local held = sync.held_count()
+  if was_viewing and held > 0 then
+    config.log(
+      'warn',
+      '%d mirror file(s) changed while viewing and were not sent. :Overleaf sync import sends them.',
+      held
+    )
+  end
+  return true
+end
+
+--- Pick a mode from a list of the ones this session may use.
+function M.select_mode()
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    return
+  end
+
+  vim.ui.select(mode.allowed(), {
+    prompt = 'Overleaf mode:',
+    format_item = function(m) return string.format('%s %-10s %s', m == mode.get() and '*' or ' ', m, M._mode_note(m)) end,
+  }, function(choice)
+    if choice then M.set_mode(choice) end
+  end)
 end
 
 function M.status()
@@ -1915,12 +2046,16 @@ function M.statusline()
 
   local proj = M._state.project_name or '?'
 
+  -- Editing is the default and says nothing; the other two are worth a glance,
+  -- since they change what a keystroke does.
+  local suffix = mode.get() == mode.EDITING and '' or (' [' .. mode.get() .. ']')
+
   -- Show current doc name if in an overleaf buffer
   local bufname = vim.api.nvim_buf_get_name(0)
   local doc_path = sync.parse_buf_name(bufname)
-  if doc_path then return 'OL: ' .. proj .. ' / ' .. doc_path end
+  if doc_path then return 'OL: ' .. proj .. ' / ' .. doc_path .. suffix end
 
-  return 'OL: ' .. proj
+  return 'OL: ' .. proj .. suffix
 end
 
 return M

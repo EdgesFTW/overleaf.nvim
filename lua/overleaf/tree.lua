@@ -184,6 +184,7 @@ function M._create_folder()
 end
 
 function M._delete_entry()
+  if not require('overleaf.mode').require_write('deleting') then return end
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
   local tree = project._project_tree
   if line_idx > #tree then return end
@@ -220,6 +221,7 @@ function M._upload_file()
 end
 
 function M._rename_entry()
+  if not require('overleaf.mode').require_write('renaming') then return end
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
   local tree = project._project_tree
   if line_idx > #tree then return end

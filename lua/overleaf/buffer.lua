@@ -1,4 +1,6 @@
 local ot = require('overleaf.ot')
+local diff = require('overleaf.diff')
+local mode = require('overleaf.mode')
 local config = require('overleaf.config')
 
 local M = {}
@@ -177,40 +179,6 @@ local function line_start_offset(lines, idx)
   return off
 end
 
---- Walk back to a UTF-8 character boundary so a common prefix/suffix never
---- splits a multi-byte codepoint.
-local function floor_char_boundary(str, n)
-  while n > 0 and n < #str and bit.band(str:byte(n + 1), 0xC0) == 0x80 do
-    n = n - 1
-  end
-  return n
-end
-
---- Length of the common prefix of two strings, on a character boundary.
-local function common_prefix_len(a, b)
-  local max = math.min(#a, #b)
-  local i = 0
-  while i < max and a:byte(i + 1) == b:byte(i + 1) do
-    i = i + 1
-  end
-  return floor_char_boundary(a, i)
-end
-
---- Length of the common suffix, on a character boundary and not overlapping
---- the prefix already claimed.
-local function common_suffix_len(a, b, prefix_len)
-  local max = math.min(#a, #b) - prefix_len
-  local i = 0
-  while i < max and a:byte(#a - i) == b:byte(#b - i) do
-    i = i + 1
-  end
-  -- Ensure the suffix starts on a character boundary in both strings.
-  while i > 0 and bit.band(a:byte(#a - i + 1), 0xC0) == 0x80 do
-    i = i - 1
-  end
-  return i
-end
-
 --- Record that lines [first, last_new) of `buf` changed.
 local function mark_dirty(doc, buf, first, last_new)
   local line_count = vim.api.nvim_buf_line_count(buf)
@@ -274,20 +242,12 @@ function M.reconcile(doc)
 
   if old_text == new_text then return end
 
+  -- Turn the difference into ops that touch only what changed. A change that
+  -- reaches several places at once (an external tool rewriting the buffer) must
+  -- not delete and re-insert the text between them: Overleaf drops any comment
+  -- or suggestion anchored to text an op deletes, even if it is put straight back.
   local span_offset = line_start_offset(mirror_lines, m_first)
-  local prefix = common_prefix_len(old_text, new_text)
-  local suffix = common_suffix_len(old_text, new_text, prefix)
-
-  local deleted = old_text:sub(prefix + 1, #old_text - suffix)
-  local inserted = new_text:sub(prefix + 1, #new_text - suffix)
-  if deleted == '' and inserted == '' then return end
-
-  local byte_pos = span_offset + prefix
-  local char_pos = ot.byte_to_char(doc.content, byte_pos)
-
-  local ops = {}
-  if #deleted > 0 then table.insert(ops, { p = char_pos, d = deleted }) end
-  if #inserted > 0 then table.insert(ops, { p = char_pos, i = inserted }) end
+  local ops = diff.ops(old_text, new_text, ot.byte_to_char(doc.content, span_offset), { words = mode.tracked() })
   if #ops == 0 then return end
 
   local ok, updated = pcall(ot.apply, doc.content, ops)
@@ -329,6 +289,63 @@ function M.attach(bufnr, doc)
   })
 end
 
+--- Run `fn` with the buffer writable, then put 'modifiable' back. Viewing mode
+--- makes buffers read-only for the user; the plugin still has to apply what
+--- arrives from the server.
+---@param bufnr number
+---@param fn function
+function M.unlocked(bufnr, fn)
+  local was = vim.bo[bufnr].modifiable
+  vim.bo[bufnr].modifiable = true
+  local ok, err = pcall(fn)
+  if vim.api.nvim_buf_is_valid(bufnr) then vim.bo[bufnr].modifiable = was end
+  if not ok then error(err, 0) end
+end
+
+--- Apply OT ops to a buffer as in-place edits, so extmarks -- comment
+--- highlights, diagnostics -- follow the text instead of being swept away.
+---@param bufnr number
+---@param ops table[] applied in order, each against the text the last one left
+---@return boolean ok, string|nil err
+function M.apply_ops(bufnr, ops)
+  for _, op in ipairs(ops) do
+    local ok, err = pcall(function()
+      if op.d then
+        local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+        -- Convert character offset to byte offset for Neovim
+        local byte_p = ot.char_to_byte(buf_content, op.p)
+        local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
+        local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
+        vim.api.nvim_buf_set_text(bufnr, start_row, start_col, end_row, end_col, { '' })
+      end
+      if op.i then
+        local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+        local byte_p = ot.char_to_byte(buf_content, op.p)
+        local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
+        vim.api.nvim_buf_set_text(bufnr, row, col, row, col, vim.split(op.i, '\n', { plain = true }))
+      end
+    end)
+    if not ok then return false, err end
+  end
+  return true, nil
+end
+
+--- Make the buffer hold `content`, changing only the text that differs.
+--- nvim_buf_set_lines over the whole buffer would collapse every extmark to one
+--- point, so the comment highlights would be gone locally although the server
+--- (sent the same small ops) still has them.
+---@param bufnr number
+---@param content string
+function M.replace_content(bufnr, content)
+  local current = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  if current == content then return end
+
+  local ok = M.apply_ops(bufnr, diff.ops(current, content))
+  if not ok or table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n') ~= content then
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(content, '\n', { plain = true }))
+  end
+end
+
 function M.apply_remote(doc, ops)
   if not doc.bufnr or not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
 
@@ -338,35 +355,15 @@ function M.apply_remote(doc, ops)
     M.reconcile(doc)
 
     doc.applying_remote = true
+    local was_modifiable = vim.bo[doc.bufnr].modifiable
+    vim.bo[doc.bufnr].modifiable = true
 
     local had_error = false
 
-    for _, op in ipairs(ops) do
-      local ok, err = pcall(function()
-        if op.d then
-          local all_lines = vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
-          local buf_content = table.concat(all_lines, '\n')
-          -- Convert character offset to byte offset for Neovim
-          local byte_p = ot.char_to_byte(buf_content, op.p)
-          local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
-          local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
-          vim.api.nvim_buf_set_text(doc.bufnr, start_row, start_col, end_row, end_col, { '' })
-        end
-        if op.i then
-          local all_lines = vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
-          local buf_content = table.concat(all_lines, '\n')
-          -- Convert character offset to byte offset for Neovim
-          local byte_p = ot.char_to_byte(buf_content, op.p)
-          local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
-          local insert_lines = vim.split(op.i, '\n', { plain = true })
-          vim.api.nvim_buf_set_text(doc.bufnr, row, col, row, col, insert_lines)
-        end
-      end)
-      if not ok then
-        config.log('error', 'Failed to apply remote op: %s', err)
-        had_error = true
-        break
-      end
+    local applied, apply_err = M.apply_ops(doc.bufnr, ops)
+    if not applied then
+      config.log('error', 'Failed to apply remote op: %s', apply_err)
+      had_error = true
     end
 
     -- Fallback: if any op failed, replace buffer entirely from doc.content
@@ -377,6 +374,7 @@ function M.apply_remote(doc, ops)
     end
 
     vim.bo[doc.bufnr].modified = false
+    vim.bo[doc.bufnr].modifiable = was_modifiable
     doc.applying_remote = false
   end)
 end

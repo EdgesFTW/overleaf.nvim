@@ -18,6 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const {
   createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore, createFile, getFiles,
+  getUpdates, resetUpdates,
 } = require('./mock-server');
 
 // ── Test framework ─────────────────────────────────────────────────────
@@ -363,6 +364,96 @@ async function runTests() {
 
     const doc = await bridge.request('joinDoc', { docId: 'doc_utf8' });
     assertEqual(doc.lines[0], 'café!', 'UTF-8 content after insert');
+  });
+
+  // ── Test Suite: Suggestions (tracked changes) ────────────────────
+  console.log('\nSuggestions:');
+
+  // Overleaf treats an update as a suggestion when meta.tc -- an id seed the
+  // client invents -- is present, and builds each change's id from it. So it must
+  // be there exactly when asked for, and never reused between updates.
+  await test('a plain update carries no meta', async () => {
+    resetDocs();
+    resetUpdates();
+    getOrCreateDoc('doc_sugg', ['abc']);
+    await bridge.request('joinDoc', { docId: 'doc_sugg' });
+
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_sugg', op: [{ p: 3, i: 'd' }], v: 0, content: 'abc',
+    });
+
+    const sent = getUpdates();
+    assertEqual(sent.length, 1, 'one update reached the server');
+    assertEqual(sent[0].update.meta, undefined, 'no meta on a plain edit');
+  });
+
+  await test('tracked: false is the same as omitting it', async () => {
+    resetDocs();
+    resetUpdates();
+    getOrCreateDoc('doc_sugg', ['abc']);
+    await bridge.request('joinDoc', { docId: 'doc_sugg' });
+
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_sugg', op: [{ p: 3, i: 'd' }], v: 0, content: 'abc', tracked: false,
+    });
+
+    assertEqual(getUpdates()[0].update.meta, undefined, 'no meta');
+  });
+
+  await test('a tracked update carries an 18-hex-digit id seed and still validates', async () => {
+    resetDocs();
+    resetUpdates();
+    getOrCreateDoc('doc_sugg', ['abc']);
+    await bridge.request('joinDoc', { docId: 'doc_sugg' });
+
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_sugg', op: [{ p: 3, i: 'd' }], v: 0, content: 'abc', tracked: true,
+    });
+
+    const update = getUpdates()[0].update;
+    assert(update.meta && /^[0-9a-f]{18}$/.test(update.meta.tc), 'meta.tc is 18 hex digits: ' + JSON.stringify(update.meta));
+    assert(update.hash, 'the content hash is still sent');
+
+    // The mock validates the hash; the edit landing means it matched.
+    const doc = await bridge.request('joinDoc', { docId: 'doc_sugg' });
+    assertEqual(doc.lines[0], 'abcd', 'the edit was applied');
+  });
+
+  await test('every tracked update gets its own seed', async () => {
+    resetDocs();
+    resetUpdates();
+    getOrCreateDoc('doc_sugg', ['abc']);
+    await bridge.request('joinDoc', { docId: 'doc_sugg' });
+
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_sugg', op: [{ p: 3, i: 'd' }], v: 0, content: 'abc', tracked: true,
+    });
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_sugg', op: [{ p: 4, i: 'e' }], v: 1, content: 'abcd', tracked: true,
+    });
+
+    const seeds = getUpdates().map(u => u.update.meta.tc);
+    assertEqual(seeds.length, 2, 'two updates');
+    assert(seeds[0] !== seeds[1], 'a reused seed would give two changes the same id');
+  });
+
+  await test('a multi-hunk update applies each hunk against the original text', async () => {
+    resetDocs();
+    resetUpdates();
+    getOrCreateDoc('doc_sugg', ['alpha beta omega']);
+    await bridge.request('joinDoc', { docId: 'doc_sugg' });
+
+    // Descending order, as diff.lua emits: the later hunk first.
+    const op = [
+      { p: 11, d: 'omega' }, { p: 11, i: 'OMEGA' },
+      { p: 0, d: 'alpha' }, { p: 0, i: 'ALPHA' },
+    ];
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_sugg', op, v: 0, content: 'alpha beta omega',
+    });
+
+    const doc = await bridge.request('joinDoc', { docId: 'doc_sugg' });
+    assertEqual(doc.lines[0], 'ALPHA beta OMEGA', 'only the two words changed');
   });
 
   // ── Test Suite: Multi-client Broadcasting ────────────────────────

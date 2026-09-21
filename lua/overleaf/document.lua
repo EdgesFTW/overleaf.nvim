@@ -98,6 +98,7 @@ function Document:flush()
     op = self.inflight_op,
     v = self.version,
     content = self.server_content,
+    tracked = require('overleaf.mode').tracked(),
   }, function(err, _)
     if err then
       config.log('warn', 'OT update failed for %s: %s — rejoining', self.path, err.message)
@@ -181,7 +182,10 @@ function Document:rejoin(attempt)
       if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
         vim.schedule(function()
           self.applying_remote = true
-          vim.api.nvim_buf_set_lines(self.bufnr, 0, -1, false, result.lines)
+          require('overleaf.buffer').unlocked(
+            self.bufnr,
+            function() vim.api.nvim_buf_set_lines(self.bufnr, 0, -1, false, result.lines) end
+          )
           vim.bo[self.bufnr].modified = false
           self.applying_remote = false
         end)

@@ -11,6 +11,13 @@ local subcommands = {
   preview = function() require('overleaf').preview_file() end,
   pdf = function() require('overleaf').open_pdf() end,
   forward = function() require('overleaf').forward_search() end,
+  mode = function(args)
+    if args and args ~= '' then
+      require('overleaf').set_mode(args)
+    else
+      require('overleaf').select_mode()
+    end
+  end,
   new = function(args) require('overleaf').create_doc(args) end,
   mkdir = function(args) require('overleaf').create_folder(args) end,
   delete = function() require('overleaf').delete_entity() end,
@@ -88,6 +95,9 @@ end, {
       end
       table.sort(out)
       return out
+    end
+    if sub == 'mode' then
+      return vim.tbl_filter(function(m) return m:find(arglead or '', 1, true) == 1 end, require('overleaf.mode').ALL)
     end
     if sub == 'comments' then return { 'refresh' } end
     if sub == 'sync' then return { 'import', 'export' } end

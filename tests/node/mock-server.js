@@ -34,6 +34,10 @@ function getOrCreateDoc(docId, lines) {
   return docs[docId];
 }
 
+// Every applyOtUpdate the server received, verbatim, so tests can check what the
+// client actually put on the wire (meta, hash, op shape).
+const receivedUpdates = [];
+
 function resetDocs() {
   for (const k of Object.keys(docs)) delete docs[k];
 }
@@ -231,6 +235,7 @@ class MockClient {
 
   onApplyOtUpdate(args, ackId) {
     const [docId, update] = args;
+    receivedUpdates.push({ docId, update });
     const doc = docs[docId];
 
     if (!doc) {
@@ -529,4 +534,5 @@ if (require.main === module) {
 module.exports = {
   createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore,
   createFile, resetFiles, getFiles: () => files,
+  getUpdates: () => receivedUpdates, resetUpdates: () => { receivedUpdates.length = 0; },
 };

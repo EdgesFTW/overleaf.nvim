@@ -277,13 +277,20 @@ class SocketManager {
     return {};
   }
 
-  async applyOtUpdate(docId, op, version, content) {
+  // `tracked` sends the edit as a suggestion (Overleaf's "reviewing"): the server
+  // reads `meta.tc` -- an id seed -- to decide whether an update is a tracked
+  // change, and derives each change's id from it. A seed reused by two updates
+  // would give their changes the same ids, so every update gets its own.
+  async applyOtUpdate(docId, op, version, content, tracked) {
     const update = {
       doc: docId,
       op: op,
       v: version,
       lastV: version,
     };
+    if (tracked) {
+      update.meta = { tc: crypto.randomBytes(9).toString('hex') };
+    }
 
     // Compute SHA1 hash on content AFTER applying ops (git blob format)
     // content param is the server_content BEFORE ops; apply ops to get new content

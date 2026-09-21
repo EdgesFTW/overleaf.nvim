@@ -26,6 +26,13 @@ M._config = {
   --   { 'asm', 'c' } - only fileRefs with these extensions (content still checked)
   --   false   - never; fileRefs are download-only, as before
   editable_files = 'auto',
+  -- How this client changes the project, as in Overleaf's editor:
+  --   'auto'       - editing where the project allows it, else the nearest mode
+  --   'editing'    - edits are applied as typed
+  --   'suggesting' - edits are sent as tracked changes (suggestions)
+  --   'viewing'    - read-only; nothing is sent, the disk mirror is not pushed
+  -- Switch at any time with :Overleaf mode.
+  mode = 'auto',
   -- Every default keymap hangs off this prefix, so the whole set can be moved
   -- aside when another plugin already claims '<leader>o' (obsidian.nvim, say).
   keymap_prefix = '<leader>o',

@@ -43,9 +43,7 @@ local function teardown(bufnr)
   if bufnr and vim.api.nvim_buf_is_valid(bufnr) then vim.api.nvim_buf_delete(bufnr, { force = true }) end
 end
 
-local function buf_text(bufnr)
-  return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-end
+local function buf_text(bufnr) return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n') end
 
 --- Drive a change with real keystrokes, then let any deferred work run.
 local function keys(bufnr, k)
@@ -65,6 +63,45 @@ local function assert_in_sync(doc, bufnr, note)
 end
 
 describe('buffer change shapes', function()
+  -- shape: several separate places changed at once, e.g. an external tool
+  -- rewriting the whole buffer. The text between them must not be deleted and
+  -- retyped: Overleaf drops comments and suggestions anchored to it.
+  describe('a rewrite that changes several distant places', function()
+    it('sends one small hunk per place rather than one hunk spanning them all', function()
+      local text = 'alpha line\nThe quick brown fox jumps over the lazy dog.\nomega line'
+      local doc, bufnr = setup(text)
+      vim.api.nvim_buf_set_lines(
+        bufnr,
+        0,
+        -1,
+        false,
+        vim.split((text:gsub('alpha', 'ALPHA'):gsub('omega', 'OMEGA')), '\n', { plain = true })
+      )
+      settle()
+
+      assert_in_sync(doc, bufnr)
+      assert.are.equal(1, #doc._submitted_ops)
+      local ops = doc._submitted_ops[1]
+      assert.are.equal(4, #ops)
+      for _, op in ipairs(ops) do
+        assert.is_nil((op.d or op.i):find('quick', 1, true), 'the untouched middle line was sent')
+      end
+      -- Descending, so each position is valid against the text as it was.
+      assert.is_true(ops[1].p > ops[3].p)
+      teardown(bufnr)
+    end)
+
+    it('keeps a multibyte document in sync', function()
+      local text = 'zażółć gęślą\nmiddle line stays\njaźń end'
+      local doc, bufnr = setup(text)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'ZAŻÓŁĆ gęślą', 'middle line stays', 'jaźń END' })
+      settle()
+
+      assert_in_sync(doc, bufnr)
+      teardown(bufnr)
+    end)
+  end)
+
   -- shape: text inserted inside an existing line
   describe('insert within a line', function()
     it('via keystrokes', function()
