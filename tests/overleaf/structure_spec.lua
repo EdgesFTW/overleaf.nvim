@@ -246,6 +246,20 @@ describe('project structure events', function()
     assert.are.equal(1, count)
   end)
 
+  it('does not recreate a remote new document when its mirror is written', function()
+    config.setup({ sync_new_files = true })
+    ol._state.connected = true
+    sync._new_file_state = ol._state
+    sync.scan_new_files(ol._state)
+    dispatch('reciveNewDoc', { parentFolderId = 'root', doc = { _id = 'remote', name = 'remote.tex' } })
+    sync.write_doc({ doc_id = 'remote', path = 'remote.tex', content = 'remote content' })
+    vim.wait(800, function() return false end)
+    for _, call in ipairs(calls) do
+      assert.are_not.equal('createDoc', call.method)
+    end
+    assert.are.equal('remote content', read(sync.file_path('remote.tex')))
+  end)
+
   it('adds a new folder once at the parent depth', function()
     local data = { parentFolderId = 'folder', folder = { _id = 'newfolder', name = 'new' } }
     dispatch('reciveNewFolder', data)

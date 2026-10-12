@@ -279,6 +279,9 @@ require('overleaf').setup({
   -- Local file sync directory for external tools like Claude Code (default: nil = disabled)
   -- When set, all documents are mirrored to disk and external changes are synced back.
   sync_dir = '~/.overleaf',
+  -- New files made in the mirror stay local by default. Set true to import
+  -- Overleaf text documents; list binary extensions to allow fileRef uploads.
+  sync_new_files = false, -- or true, or { binary = { 'png', 'pdf' } }
   -- Files Overleaf stores as binary but whose content is text (.asm, .c, ...):
   -- 'auto' (default) edits them by re-upload, a list like { 'asm', 'c' }
   -- restricts that to those extensions, false leaves them download-only.
@@ -315,6 +318,19 @@ require('overleaf').setup({
 
 When connected to a project, all text documents are synced to `~/.overleaf/<project-name>/`. External tools can read and edit these files — changes are automatically detected and synced back to Overleaf.
 
+New files made on disk stay local by default. Set `sync_new_files = true` to
+create Overleaf documents from new files with Overleaf's default text-document
+extensions (including `tex`, `bib`, `sty`, `cls`, `txt`, and `md`). Use
+`sync_new_files = { binary = { 'png', 'pdf' } }` to allow those fileRef uploads
+as well. A new subfolder is created in the project before its file. Each
+mirrored folder has its own watcher, and a file is imported after its size is
+unchanged for 500 ms. Dotfiles, editor temp files, conflict copies, and LaTeX
+build output are ignored. PDFs are ignored unless `pdf` is explicitly listed.
+In viewing mode, imports are held. In suggesting mode, new text documents are
+created empty and their content is sent as a tracked insertion; binary uploads
+are held. If the server refuses creation, the file remains on disk and is held.
+Disk deletions and renames are never sent to Overleaf automatically.
+
 ### How it works
 
 - **On connect**: all documents are fetched and written to disk
@@ -329,6 +345,11 @@ When connected to a project, all text documents are synced to `~/.overleaf/<proj
 - `:Overleaf sync` — re-sync all documents (fetch from Overleaf and write to disk)
 - `:Overleaf sync import` — import all external disk changes to Overleaf
 - `:Overleaf sync export` — export all documents to disk
+- `:Overleaf sync status` — list disk-only files, project files missing on disk,
+  and held changes, even when automatic new-file import is off
+
+`:Overleaf sync import` also checks disk-only files explicitly, using the same
+extension and mode rules even when `sync_new_files = false`.
 
 ### Files Overleaf stores as binary
 

@@ -2122,6 +2122,8 @@ function M.sync_export()
   sync.export_all(M._state)
 end
 
+function M.sync_status() sync.status(project._project_tree) end
+
 function M._teardown(stop_bridge, callback)
   -- Stop auto-reconnect
   M._reconnect.attempt = 0

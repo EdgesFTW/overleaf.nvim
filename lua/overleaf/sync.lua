@@ -35,12 +35,33 @@ M._file_timers = {} -- disk path -> debounce timer
 M._last_uploaded = {} -- disk path -> the exact bytes last sent to Overleaf
 M._uploading = {} -- disk path -> bytes of an upload in flight (so the watcher does not resend them)
 M._held = {} -- disk path -> true: changed on disk while the mode forbade sending it
+M._dir_watchers = {} -- directory -> fs_event handle (Linux events are not recursive)
+M._dir_inodes = {} -- directory -> inode, for rename-replaced folders
+M._new_file_timers = {} -- disk path -> stability timer
+M._creating = {} -- project path -> true while create/upload is in flight
+M._folder_pending = {} -- project folder path -> waiting callbacks
+M._new_file_state = nil -- state passed to sync_all, for directory events
+M._generation = 0 -- invalidates callbacks when switching projects
+
+-- Overleaf's default editable document extensions. There is no extension list
+-- in the bridge or project modules; they classify existing fileRefs by content.
+local TEXT_EXTENSIONS = {}
+for ext in
+  (
+    'tex latex sty cls bst bib bibtex txt tikz mtx rtex md asy lbx bbx cbx m lco '
+    .. 'dtx ins ist def clo ldf rmd qmd lua py gv mf yml yaml lhs lean lean4 '
+    .. 'hs mk xmpdata cfg rnw ltx inc fd'
+  ):gmatch('%S+')
+do
+  TEXT_EXTENSIONS[ext] = true
+end
 
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
 function M.start(project_name)
   local sync_dir = config.get().sync_dir
   if not sync_dir then return end
+  M._generation = M._generation + 1
 
   -- Expand ~ and resolve
   sync_dir = vim.fn.expand(sync_dir)
@@ -54,6 +75,22 @@ end
 
 --- Stop all watchers and timers
 function M.stop()
+  M._generation = M._generation + 1
+  for _, handle in pairs(M._dir_watchers) do
+    if not handle:is_closing() then
+      handle:stop()
+      handle:close()
+    end
+  end
+  M._dir_watchers = {}
+  M._dir_inodes = {}
+  for _, timer in pairs(M._new_file_timers) do
+    vim.fn.timer_stop(timer)
+  end
+  M._new_file_timers = {}
+  M._creating = {}
+  M._folder_pending = {}
+  M._new_file_state = nil
   for _, w in pairs(M._watchers) do
     if w.handle and not w.handle:is_closing() then
       w.handle:stop()
@@ -143,6 +180,7 @@ function M.write_doc(doc)
   -- Ensure parent directory exists
   local dir = vim.fn.fnamemodify(path, ':h')
   vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
+  if M._new_file_state then M.watch_directory(dir) end
 
   -- Atomic write: temp file + rename to prevent partial reads from fs_event race
   local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
@@ -359,13 +397,39 @@ function M._on_file_changed(path, doc)
   end
 end
 
+--- Send a disk change for a document that stays joined without a buffer.
+--- Joining again and leaving, as the closed-document path does, would detach
+--- the socket from a document the client still tracks as joined.
+---@param doc table Document instance (joined)
+---@param new_content string file content
+function M._sync_joined_doc(doc, new_content)
+  local ops, replaced = ot.sanitize_inserts(diff.ops(doc.content, new_content, 0, { words = mode.tracked() }))
+  if #ops == 0 then return end
+  doc.content = ot.apply(doc.content, ops)
+  doc:submit_op(ops)
+  config.log('info', 'Synced external change: %s', doc.path)
+  -- Emoji are stored as U+FFFD; put what Overleaf has back on disk.
+  if replaced then
+    config.log('warn', 'Characters outside the Basic Multilingual Plane in %s were stored as U+FFFD', doc.path)
+    M.schedule_write(doc)
+  end
+end
+
 --- Sync a changed file for a document that is not open in Neovim
 ---@param doc table Document instance
 ---@param new_content string new file content
-function M._sync_closed_doc(doc, new_content)
-  bridge.request('joinDoc', { docId = doc.doc_id }, function(err, result)
+---@param callback function|nil called with an error after the edit completes
+function M._sync_closed_doc(doc, new_content, callback)
+  callback = callback or function() end
+  if doc.joined and doc.content ~= nil then
+    M._sync_joined_doc(doc, new_content)
+    callback(nil)
+    return
+  end
+  local function joined(err, result)
     if err then
       config.log('error', 'Sync join failed for %s: %s', doc.path, err.message)
+      callback(err)
       return
     end
 
@@ -375,6 +439,7 @@ function M._sync_closed_doc(doc, new_content)
     -- No change from server's perspective
     if new_content == server_content then
       bridge.request('leaveDoc', { docId = doc.doc_id }, function() end)
+      callback(nil)
       return
     end
 
@@ -408,8 +473,10 @@ function M._sync_closed_doc(doc, new_content)
 
       -- Leave the doc
       bridge.request('leaveDoc', { docId = doc.doc_id }, function() end)
+      callback(ot_err)
     end)
-  end)
+  end
+  bridge.request('joinDoc', { docId = doc.doc_id }, joined)
 end
 
 -- ── FileRefs ─────────────────────────────────────────────────────────────
@@ -505,6 +572,7 @@ end
 local function write_bytes(path, data)
   local dir = vim.fn.fnamemodify(path, ':h')
   vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
+  if M._new_file_state then M.watch_directory(dir) end
   local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
   local f = io.open(tmp_path, 'wb')
   if not f then return false end
@@ -518,6 +586,375 @@ local function write_bytes(path, data)
     return false
   end
   return true
+end
+
+local function new_files_enabled()
+  local setting = config.get().sync_new_files
+  return setting == true or type(setting) == 'table'
+end
+
+local function binary_allowed(ext)
+  local setting = config.get().sync_new_files
+  if type(setting) ~= 'table' then return false end
+  for _, allowed in ipairs(setting.binary or {}) do
+    if tostring(allowed):lower():gsub('^%.', '') == ext then return true end
+  end
+  return false
+end
+
+local IGNORED_DIRECTORIES = { build = true, out = true, output = true, _build = true, node_modules = true }
+local IGNORED_EXTENSIONS = {
+  aux = true,
+  log = true,
+  out = true,
+  fdb_latexmk = true,
+  fls = true,
+  bbl = true,
+  blg = true,
+}
+
+local function ignored_name(name, directory)
+  if name:sub(1, 1) == '.' or name == '4913' or name:sub(-1) == '~' then return true end
+  if name:match('%.overleaf%-conflict%.') or name:match('%.tmp%.') then return true end
+  if name:match('%.sw[ponx]$') or name:match('%.bak$') or name:match('%.orig$') or name:match('%.rej$') then
+    return true
+  end
+  if
+    name:match('%.part$')
+    or name:match('%.crdownload$')
+    or name:match('%.tmp$')
+    or name:match('%.temp$')
+    or name:match('%.new$')
+    or name:match('^#.*#$')
+  then
+    return true
+  end
+  if directory then return IGNORED_DIRECTORIES[name:lower()] == true end
+  local ext = (name:match('%.([^%.]+)$') or ''):lower()
+  if IGNORED_EXTENSIONS[ext] or name:lower():match('%.synctex%.gz$') then return true end
+  return ext == 'pdf' and not binary_allowed('pdf')
+end
+
+local function tree_refresh()
+  vim.schedule(function() require('overleaf.tree').refresh() end)
+end
+
+local function entry_depth(parent_id, project)
+  local parent = project.get_doc_by_id(parent_id)
+  return parent and (parent.depth or 0) + 1 or 0
+end
+
+local function request_params(state)
+  return { cookie = config.get().cookie, csrfToken = state.csrf_token, projectId = state.project_id }
+end
+
+-- Several files may appear in a new folder at once. Queue them behind one
+-- createFolder request, and build parents from the root outward.
+local function ensure_folder(folder_path, state, callback)
+  local generation = M._generation
+  local project = require('overleaf.project')
+  if folder_path == '' then
+    callback(nil, project._root_folder_id)
+    return
+  end
+  local existing = project.get_doc_by_path(folder_path)
+  if existing then
+    callback(nil, existing.id)
+    return
+  end
+  if M._folder_pending[folder_path] then
+    table.insert(M._folder_pending[folder_path], callback)
+    return
+  end
+  M._folder_pending[folder_path] = { callback }
+  local parent_path = folder_path:sub(1, -2):match('^(.*/)') or ''
+  ensure_folder(parent_path, state, function(parent_err, parent_id)
+    local function finish(err, id)
+      local pending = M._folder_pending[folder_path] or {}
+      M._folder_pending[folder_path] = nil
+      for _, cb in ipairs(pending) do
+        cb(err, id)
+      end
+    end
+    if parent_err then
+      finish(parent_err)
+      return
+    end
+    local name = folder_path:sub(#parent_path + 1, -2)
+    local params = request_params(state)
+    params.name, params.parentFolderId = name, parent_id
+    bridge.request('createFolder', params, function(err, result)
+      if M._generation ~= generation then return end
+      if err then
+        finish(err)
+        return
+      end
+      local id = (result and (result._id or result.id)) or (project.get_doc_by_path(folder_path) or {}).id
+      if not id then
+        finish({ message = 'createFolder returned no id' })
+        return
+      end
+      project.add_entry({
+        id = id,
+        name = name,
+        path = folder_path,
+        type = 'folder',
+        depth = entry_depth(parent_id, project),
+      })
+      tree_refresh()
+      finish(nil, id)
+    end)
+  end)
+end
+
+--- Import one stable, new disk file. The path must be inside the mirror.
+function M._import_new_file(path, state)
+  if not M._sync_dir or not state or not state.connected then return end
+  local project = require('overleaf.project')
+  local rel = path:sub(#M._sync_dir + 2)
+  if path:sub(1, #M._sync_dir + 1) ~= M._sync_dir .. '/' then return end
+  if project.path_exists(rel) or M._last_written[path] ~= nil or M._creating[rel] or M._held[path] then return end
+  local name = rel:match('([^/]+)$')
+  local ext = (name:match('%.([^%.]+)$') or ''):lower()
+  if ignored_name(name, false) then return end
+  local is_doc = TEXT_EXTENSIONS[ext] == true
+  if not is_doc and not binary_allowed(ext) then return end
+  local data = read_bytes(path)
+  if not data then return end
+  if is_doc and not M.is_text(data) then
+    hold(path, rel)
+    config.log('warn', 'Not creating %s: it is not valid UTF-8 text', rel)
+    return
+  end
+  if not mode.writable() or (not is_doc and not mode.can_replace_files()) then
+    hold(path, rel)
+    return
+  end
+
+  M._creating[rel] = true
+  local generation = M._generation
+  local parent_path = rel:match('^(.*/)') or ''
+  ensure_folder(parent_path, state, function(folder_err, parent_id)
+    if M._generation ~= generation then return end
+    if folder_err then
+      M._creating[rel] = nil
+      hold(path, rel)
+      config.log('warn', 'Could not create parent folder for %s: %s', rel, folder_err.message or tostring(folder_err))
+      return
+    end
+    if not vim.uv.fs_stat(path) then
+      M._creating[rel] = nil
+      return
+    end
+    local params = request_params(state)
+    params.name, params.parentFolderId = name, parent_id
+    if is_doc then
+      bridge.request('createDoc', params, function(err, result)
+        if M._generation ~= generation then return end
+        if err then
+          M._creating[rel] = nil
+          hold(path, rel)
+          config.log('warn', 'Could not create %s on Overleaf: %s', rel, err.message or tostring(err))
+          return
+        end
+        local id = (result and (result._id or result.id)) or (project.get_doc_by_path(rel) or {}).id
+        if not id then
+          M._creating[rel] = nil
+          hold(path, rel)
+          config.log('warn', 'Could not create %s: createDoc returned no id', rel)
+          return
+        end
+        local entry = { id = id, name = name, path = rel, type = 'doc', depth = entry_depth(parent_id, project) }
+        project.add_entry(entry)
+        tree_refresh()
+        local Document = require('overleaf.document')
+        local doc = state.documents[id] or Document.new(id, rel)
+        state.documents[id] = doc
+        -- Joined through the Document, which then stays joined: the content
+        -- goes out as an ordinary op with acks, resends and rejoins handled
+        -- there, and as a tracked insertion in suggesting mode (decision D4).
+        doc:join(function(join_err)
+          if M._generation ~= generation then return end
+          if join_err then
+            M._creating[rel] = nil
+            hold(path, rel)
+            config.log('warn', 'Could not join new document %s: %s', rel, join_err.message or tostring(join_err))
+            return
+          end
+          M._creating[rel] = nil
+          if doc.content ~= '' then
+            hold(path, rel)
+            config.log('warn', 'New document %s already has server content; local content was held', rel)
+            return
+          end
+          M._held[path] = nil
+          M._last_written[path] = data
+          M._sync_joined_doc(doc, data)
+          M.watch(doc)
+        end)
+      end)
+    else
+      local entry = { name = name, path = rel, type = 'file', depth = entry_depth(parent_id, project) }
+      M.upload_file(entry, path, data, function(err, result)
+        if M._generation ~= generation then return end
+        M._creating[rel] = nil
+        if err then
+          hold(path, rel)
+          return
+        end
+        entry.id = (result and result.entity_id) or (project.get_doc_by_path(rel) or {}).id
+        if entry.id then
+          project.add_entry(entry)
+          tree_refresh()
+        end
+      end, state)
+    end
+  end)
+end
+
+local function check_stable_file(path, state, manual)
+  if M._new_file_timers[path] then return end
+  local initial = vim.uv.fs_stat(path)
+  if not initial or initial.type ~= 'file' then return end
+  M._new_file_timers[path] = vim.fn.timer_start(500, function()
+    M._new_file_timers[path] = nil
+    if not M._sync_dir or (not manual and M._new_file_state ~= state) then return end
+    local current = vim.uv.fs_stat(path)
+    if not current or current.type ~= 'file' then return end
+    if current.size ~= initial.size then
+      check_stable_file(path, state, manual)
+    else
+      M._import_new_file(path, state)
+    end
+  end)
+end
+
+--- Watch a mirrored folder. Each directory needs its own fs_event on Linux.
+function M.watch_directory(dir)
+  if not M._sync_dir or not M._new_file_state then return end
+  local stat = vim.uv.fs_stat(dir)
+  if not stat or stat.type ~= 'directory' then return end
+  if M._dir_watchers[dir] then
+    if M._dir_inodes[dir] == stat.ino then return end
+    local old = M._dir_watchers[dir]
+    if not old:is_closing() then
+      old:stop()
+      old:close()
+    end
+    M._dir_watchers[dir] = nil
+  end
+  local handle = vim.uv.new_fs_event()
+  if not handle then return end
+  local ok = handle:start(dir, {}, function(err)
+    if err then return end
+    vim.schedule(function()
+      if M._dir_watchers[dir] == handle then M.scan_new_files(M._new_file_state) end
+    end)
+  end)
+  if not ok then
+    handle:close()
+    return
+  end
+  M._dir_watchers[dir] = handle
+  M._dir_inodes[dir] = stat.ino
+end
+
+--- Scan current folders and add watches for folders created after connect.
+--- Called on directory events as well as at the end of the initial sync.
+function M.scan_new_files(state, manual)
+  if not M._sync_dir then return end
+  local seen = {}
+  local function visit(dir, prefix)
+    seen[dir] = true
+    if new_files_enabled() then M.watch_directory(dir) end
+    local scan = vim.uv.fs_scandir(dir)
+    if not scan then return end
+    while true do
+      local name, kind = vim.uv.fs_scandir_next(scan)
+      if not name then break end
+      local path = dir .. '/' .. name
+      if kind == 'directory' and not ignored_name(name, true) then
+        visit(path, prefix .. name .. '/')
+      elseif kind == 'file' and (new_files_enabled() or manual) and not ignored_name(name, false) then
+        local rel = prefix .. name
+        local project = require('overleaf.project')
+        if
+          not project.path_exists(rel)
+          and M._last_written[path] == nil
+          and not M._creating[rel]
+          and not M._held[path]
+        then
+          check_stable_file(path, state, manual)
+        end
+      end
+    end
+  end
+  visit(M._sync_dir, '')
+  for dir, handle in pairs(M._dir_watchers) do
+    if not seen[dir] or not new_files_enabled() then
+      if not handle:is_closing() then
+        handle:stop()
+        handle:close()
+      end
+      M._dir_watchers[dir] = nil
+      M._dir_inodes[dir] = nil
+    end
+  end
+end
+
+--- Compare regular disk files with the project tree, including held edits.
+function M.status(project_tree)
+  if not M._sync_dir then
+    config.log('warn', 'File sync not enabled (set sync_dir in config)')
+    return nil
+  end
+  local known = {}
+  for _, entry in ipairs(project_tree or {}) do
+    if entry.type == 'doc' or entry.type == 'file' then known[entry.path] = true end
+  end
+  local disk = {}
+  local function visit(dir, prefix)
+    local scan = vim.uv.fs_scandir(dir)
+    if not scan then return end
+    while true do
+      local name, kind = vim.uv.fs_scandir_next(scan)
+      if not name then break end
+      if kind == 'directory' then
+        visit(dir .. '/' .. name, prefix .. name .. '/')
+      elseif kind == 'file' then
+        disk[prefix .. name] = true
+      end
+    end
+  end
+  visit(M._sync_dir, '')
+  local result = { disk_only = {}, missing_on_disk = {}, held = {} }
+  for path in pairs(disk) do
+    if not known[path] then table.insert(result.disk_only, path) end
+  end
+  for path in pairs(known) do
+    if not disk[path] then table.insert(result.missing_on_disk, path) end
+  end
+  for path in pairs(M._held) do
+    if path:sub(1, #M._sync_dir + 1) == M._sync_dir .. '/' then
+      table.insert(result.held, path:sub(#M._sync_dir + 2))
+    end
+  end
+  for _, list in pairs(result) do
+    table.sort(list)
+  end
+  local lines = { 'Mirror status:' }
+  for _, group in ipairs({
+    { 'Disk only', result.disk_only },
+    { 'Missing on disk', result.missing_on_disk },
+    { 'Held changes', result.held },
+  }) do
+    table.insert(lines, string.format('%s (%d):', group[1], #group[2]))
+    for _, path in ipairs(group[2]) do
+      table.insert(lines, '  ' .. path)
+    end
+  end
+  vim.notify(table.concat(lines, '\n'), vim.log.levels.INFO)
+  return result
 end
 
 --- Download a fileRef, classify it, and mirror it to the sync directory.
@@ -710,11 +1147,11 @@ end
 ---@param local_path string file to send
 ---@param data string|nil the bytes at local_path, if already read
 ---@param callback function|nil called with (err, result)
-function M.upload_file(entry, local_path, data, callback)
+function M.upload_file(entry, local_path, data, callback, state_override)
   callback = callback or function() end
   local ol = require('overleaf')
   local project = require('overleaf.project')
-  local state = ol._state
+  local state = state_override or ol._state
   if not state.connected then
     config.log('warn', 'Not connected; %s not uploaded', entry.path)
     callback({ code = 'NOT_CONNECTED', message = 'Not connected' })
@@ -777,6 +1214,13 @@ function M.sync_all(state, project_tree, callback)
 
   local docs = {}
   local files = {}
+  local function finish()
+    if new_files_enabled() then
+      M._new_file_state = state
+      M.scan_new_files(state)
+    end
+    if callback then callback() end
+  end
   for _, entry in ipairs(project_tree) do
     if entry.type == 'doc' then
       table.insert(docs, entry)
@@ -799,7 +1243,7 @@ function M.sync_all(state, project_tree, callback)
 
   -- Sync text documents
   if #docs == 0 then
-    if callback then callback() end
+    finish()
     return
   end
 
@@ -810,7 +1254,7 @@ function M.sync_all(state, project_tree, callback)
     remaining = remaining - 1
     if remaining <= 0 then
       config.log('info', 'Sync complete: %s', M._sync_dir)
-      if callback then callback() end
+      finish()
     end
   end
 
@@ -899,6 +1343,10 @@ function M.import_all(state)
       M.upload_file(known.entry, path, disk_content)
     end
   end
+
+  -- An explicit import also discovers disk-only files when automatic creation
+  -- is disabled. The same extension and mode rules still apply.
+  M.scan_new_files(state, true)
 
   if changed == 0 then
     config.log('info', 'No external changes detected')

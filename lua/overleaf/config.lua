@@ -19,6 +19,10 @@ M._config = {
   -- downloaded for forward search even when this is false.
   inverse_search = true,
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
+  -- Import newly created mirror files automatically. false (default) keeps
+  -- them on disk only; true imports Overleaf text-document extensions. Use
+  -- { binary = { 'png', 'pdf' } } to also allow those fileRef uploads.
+  sync_new_files = false,
   -- Files Overleaf stores as binary "fileRefs" (anything whose extension is
   -- not on its text whitelist, e.g. .asm or .c) have no real-time document
   -- behind them, so they can only be edited by re-uploading the whole file.
@@ -45,6 +49,12 @@ function M.setup(opts)
   if opts then
     if opts.tree_sort ~= nil and opts.tree_sort ~= 'name' and opts.tree_sort ~= 'overleaf' then
       error("tree_sort must be 'name' or 'overleaf'")
+    end
+    if opts.sync_new_files ~= nil then
+      local value = opts.sync_new_files
+      if type(value) ~= 'boolean' and (type(value) ~= 'table' or type(value.binary) ~= 'table') then
+        error("sync_new_files must be false, true, or { binary = { 'png', ... } }")
+      end
     end
     for k, v in pairs(opts) do
       M._config[k] = v

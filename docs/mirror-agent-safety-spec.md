@@ -160,6 +160,20 @@ merge has neither dependency.
 
 ## Phase 3: files created on disk (opt-in)
 
+**Done 2026-10-12.** `sync_new_files = false` (default), `true` (Overleaf's text extensions), or
+`{ binary = { 'png', … } }`; `:Overleaf sync status` lists disk-only files, files missing on disk
+and held changes.
+- A new text file is created with `createDoc` (and `createFolder` for missing parents). The
+  Document then joins it and stays joined, and the content goes out through `submit_op`: tracked in
+  suggesting mode (D4), sanitized like typed text.
+- Disk edits to a joined, bufferless document go through `_sync_joined_doc` (`submit_op`). The old
+  join-and-leave path is kept for documents that are not joined.
+
+Verified live with two clients. A new folder and document written by an "agent" appeared for the
+other client; `.aux` and dotfiles were ignored; an emoji was stored as U+FFFD and the disk copy
+rewritten to match; a later rename-replace edit reached the server; a collaborator's edit reached
+the agent's file on disk.
+
 Behind decision D3; off by default.
 
 - Watch every mirrored directory. On Linux `fs_event` is not recursive, so use one

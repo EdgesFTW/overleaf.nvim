@@ -37,6 +37,8 @@ local subcommands = {
       require('overleaf').sync_import()
     elseif args == 'export' then
       require('overleaf').sync_export()
+    elseif args == 'status' then
+      require('overleaf').sync_status()
     else
       require('overleaf').sync_all()
     end
@@ -108,7 +110,7 @@ end, {
       return vim.tbl_filter(function(m) return m:find(arglead or '', 1, true) == 1 end, require('overleaf.mode').ALL)
     end
     if sub == 'comments' then return { 'refresh' } end
-    if sub == 'sync' then return { 'import', 'export' } end
+    if sub == 'sync' then return { 'import', 'export', 'status' } end
     return {}
   end,
 })
