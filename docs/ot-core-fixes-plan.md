@@ -17,9 +17,37 @@ verified. The live stress run must confirm each one:
 - the ack's `v` is the version the op was applied at;
 - ops returned by `joinDoc` carry `meta.source`.
 
+**Observed live 2026-10-12** (two-client stress run on the B2a code, with emoji):
+- The emit callback fires before the server has ordered our op. When a
+  collaborator's op is ordered first, the client logs "ACK received, now v26",
+  then gets the collaborator's op stamped v25 ("Version mismatch: expected 26,
+  got 25").
+- The op-less `otUpdateApplied` for our op then arrives with `v=26`. So **the
+  ack's `v` is the applied-at version (confirmed)**, and the callback is not an
+  ack (F7 confirmed).
+- The client then sends an op based on the wrong state. The server answers
+  `otUpdateError "Delete component does not match"` and **boots the socket**
+  (`disconnect reason=booted`).
+- The reconnect's rejoin drops unacked edits (F5). Runs end around 60–150 bytes
+  after 60 edits.
+- So B2a alone does not make live editing converge; B2b is required.
+
 ---
 
 ## B2a: pure functions
+
+**Done 2026-10-12 (ec8d415).** An adversarial Opus review fuzzed 10,000 more cases against text0
+and 3,000 simulated documents through `Document:on_remote_op`, with no mismatches. Its one
+regression (cursor and comment rendering raising on a stale offset inside a surrogate pair) is fixed
+by `ot.u16_to_byte_floor`. Open items carried to B2b:
+- `on_remote_op` returns on an empty op without bumping the version. Overleaf broadcasts ops that
+  transform to `[]`, for example two users deleting the same text, so each one forces a rejoin.
+- `_on_ack` calls strict `ot.apply` without a pcall.
+- `ipairs(nil)` crashes when a rejoin clears `inflight_op` before the ack arrives.
+- Comment components inside remote ops are not position-transformed, so a highlight can be off
+  while an op is in flight.
+- `transform_x` recurses once per split. About 8,000 local inserts inside one remote delete
+  overflow the stack; the pcall catches it and the document rejoins. text0 has the same property.
 
 ### F1/F2: transform (`ot.lua`)
 
