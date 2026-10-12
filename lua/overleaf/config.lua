@@ -103,8 +103,12 @@ function M.load_cookie(opts)
     local f = io.open(path, 'r')
     if f then
       for line in f:lines() do
-        local key, value = line:match('^([^=]+)=(.+)$')
+        line = vim.trim(line)
+        line = line:gsub('^export%s+', '')
+        local key, value = line:match('^([%w_]+)%s*=%s*(.-)%s*$')
         if key == 'OVERLEAF_COOKIE' then
+          local quote = value:sub(1, 1)
+          if (quote == '"' or quote == "'") and value:sub(-1) == quote and #value >= 2 then value = value:sub(2, -2) end
           cookie = value
           found = true
           break

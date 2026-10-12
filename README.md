@@ -315,7 +315,7 @@ When connected to a project, all text documents are synced to `~/.overleaf/<proj
 
 - **On connect**: all documents are fetched and written to disk
 - **Neovim edits**: debounced writes keep disk files up to date
-- **Remote edits**: disk files are updated when collaborators make changes
+- **Remote edits**: open documents and their disk files update live; closed documents' disk files refresh on connect, sync, or open
 - **External edits**: file watchers detect changes and sync them to Overleaf via OT
   - For open documents: buffer is updated, triggering the normal OT pipeline
   - For closed documents: changes are sent directly via the bridge

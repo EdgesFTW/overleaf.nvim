@@ -145,6 +145,7 @@ local DEFAULT_KEYMAPS = {
   { 's', 'Forward search (SyncTeX)', function() M.forward_search() end },
   { 'M', 'Switch mode (editing/suggesting/viewing)', function() M.select_mode() end },
 }
+local installed_keymaps = {}
 
 function M.setup(opts)
   config.setup(opts)
@@ -157,6 +158,15 @@ function M.setup(opts)
 end
 
 function M._set_keymaps()
+  local current = {}
+  for _, map in ipairs(vim.api.nvim_get_keymap('n')) do
+    current[map.lhs] = map
+  end
+  for _, map in ipairs(installed_keymaps) do
+    if current[map.lhs] and current[map.lhs].callback == map.callback then vim.keymap.del('n', map.lhs) end
+  end
+  installed_keymaps = {}
+
   local cfg = config.get()
   if cfg.keymaps == false then return end
 
@@ -164,6 +174,12 @@ function M._set_keymaps()
   for _, km in ipairs(DEFAULT_KEYMAPS) do
     local suffix, desc, rhs = km[1], km[2], km[3]
     vim.keymap.set('n', prefix .. suffix, rhs, { desc = 'Overleaf: ' .. desc })
+    for _, map in ipairs(vim.api.nvim_get_keymap('n')) do
+      if map.callback == rhs then
+        table.insert(installed_keymaps, { lhs = map.lhs, callback = rhs })
+        break
+      end
+    end
   end
 
   -- Label the prefix itself so which-key shows "Overleaf" instead of a bare

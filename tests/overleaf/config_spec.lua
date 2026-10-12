@@ -90,6 +90,24 @@ describe('config', function()
       vim.fn.delete(tmp)
     end)
 
+    it('accepts export, whitespace, and matching value quotes', function()
+      for _, entry in ipairs({
+        { '  export OVERLEAF_COOKIE = "overleaf_session2=s%3Adouble"  ', 'overleaf_session2=s%3Adouble' },
+        { "\texport OVERLEAF_COOKIE='overleaf_session2=s%3Asingle' ", 'overleaf_session2=s%3Asingle' },
+        { ' OVERLEAF_COOKIE = overleaf_session2=s%3Aplain ', 'overleaf_session2=s%3Aplain' },
+        { 'OVERLEAF_COOKIE="mismatched\' ', '"mismatched\'' },
+      }) do
+        local tmp = vim.fn.tempname()
+        local f = assert(io.open(tmp, 'w'))
+        f:write('  # ignored\n\n', entry[1], '\n')
+        f:close()
+        config._config.cookie = nil
+        config.setup({ env_file = tmp })
+        assert.are.equal(entry[2], config.load_cookie())
+        vim.fn.delete(tmp)
+      end
+    end)
+
     it('tracks checked env paths when cookie is not found', function()
       local missing = vim.fn.tempname()
       config.setup({ cookie = nil, env_file = missing })

@@ -43,9 +43,17 @@ local subcommands = {
   end,
 }
 
+local rest_of_line = { open = true, new = true, mkdir = true, main = true, upload = true, search = true }
+
+local function parse_args(raw)
+  local sub, args = raw:match('^%s*(%S+)%s*(.-)%s*$')
+  if not sub then return nil, nil end
+  if not rest_of_line[sub] then args = args:match('^(%S+)') end
+  return sub, args
+end
+
 vim.api.nvim_create_user_command('Overleaf', function(opts)
-  local args = vim.split(opts.args, '%s+', { trimempty = true })
-  local sub = args[1]
+  local sub, args = parse_args(opts.args)
 
   if not sub or sub == '' then
     -- No subcommand: if connected, show status; otherwise connect
@@ -60,7 +68,7 @@ vim.api.nvim_create_user_command('Overleaf', function(opts)
 
   local handler = subcommands[sub]
   if handler then
-    handler(args[2])
+    handler(args)
   else
     vim.notify(
       'Unknown subcommand: ' .. sub .. '\nAvailable: ' .. table.concat(vim.tbl_keys(subcommands), ', '),
@@ -104,3 +112,5 @@ end, {
     return {}
   end,
 })
+
+return { parse_args = parse_args }
