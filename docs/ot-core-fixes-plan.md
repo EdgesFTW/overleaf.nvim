@@ -32,6 +32,21 @@ verified. The live stress run must confirm each one:
   after 60 edits.
 - So B2a alone does not make live editing converge; B2b is required.
 
+**Protocol facts verified live 2026-10-12** (a raw three-socket probe on a throwaway sandbox doc):
+- **P1.** Catch-up updates from `joinDoc(docId, fromVersion)` carry `meta.source`, the sender's
+  publicId (plus `user_id`, `ts`).
+- **P2.** The emit callback fires when the op is queued. Our own op is acked by an op-less
+  `otUpdateApplied` whose `v` is the applied-at version. Other clients receive it as an op with
+  `meta.source`.
+- **P3.** `dupIfSource` is honoured. Resending an applied op with `dupIfSource = [sender id]`
+  yields only an op-less ack to the sender: no broadcast, no second application.
+- **P4.** The hash is checked only on untransformed updates.
+- **P5.** A rejected op produces `otUpdateError(errorString, {project_id, doc_id, error, message})`
+  for **every client connected to the project**, and the server then **disconnects all of them**.
+  One bad op from this plugin boots every collaborator's editor.
+- **P6.** Overleaf's document-updater replaces UTF-16 surrogates in inserted text with U+FFFD, so
+  emoji and math letters are stored as `��`. Handled by `ot.sanitize_inserts`.
+
 ---
 
 ## B2a: pure functions
