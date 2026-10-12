@@ -229,10 +229,10 @@ const handlers = {
   },
 
   async joinDoc(params) {
-    const { docId } = params;
+    const { docId, fromVersion } = params;
     if (!socketManager) throw { code: 'NOT_CONNECTED', message: 'Not connected to a project' };
     if (!docId) throw { code: 'MISSING_PARAM', message: 'docId is required' };
-    return await socketManager.joinDoc(docId);
+    return await socketManager.joinDoc(docId, fromVersion);
   },
 
   async leaveDoc(params) {
@@ -243,12 +243,12 @@ const handlers = {
   },
 
   async applyOtUpdate(params) {
-    const { docId, op, v, content, tracked } = params;
+    const { docId, op, v, content, tracked, dupIfSource } = params;
     if (!socketManager) throw { code: 'NOT_CONNECTED', message: 'Not connected to a project' };
     if (!docId || op === undefined || v === undefined) {
       throw { code: 'MISSING_PARAM', message: 'docId, op, and v are required' };
     }
-    return await socketManager.applyOtUpdate(docId, op, v, content, tracked === true);
+    return await socketManager.applyOtUpdate(docId, op, v, content, tracked === true, dupIfSource);
   },
 
   async compile(params) {

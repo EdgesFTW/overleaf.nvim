@@ -85,6 +85,37 @@ function M.apply(content, ops)
   return content
 end
 
+-- Overleaf's document-updater replaces every UTF-16 surrogate in inserted text
+-- with U+FFFD (UpdateManager._sanitizeUpdate), so an emoji or a math letter such
+-- as 𝔸 is stored as two U+FFFD. Sending the real character makes the hash we
+-- attach disagree with what the server stores, and the server drops the op and
+-- disconnects us. Inserts are rewritten the same way before sending; a 4-byte
+-- character is two UTF-16 units and becomes two U+FFFD, so positions are kept.
+local REPLACEMENT = '\239\191\189'
+
+--- Rewrite inserts as Overleaf will store them.
+---@return table[] ops, boolean changed
+function M.sanitize_inserts(ops)
+  local out, changed = {}, false
+  for _, op in ipairs(ops) do
+    if op.i and (op.i:find('[\240-\247]') or op.i:find('\237[\160-\191]')) then
+      local i = op.i:gsub('[\240-\247][\128-\191][\128-\191][\128-\191]', REPLACEMENT .. REPLACEMENT)
+      -- A lone surrogate encoded in UTF-8 (CESU-style) is one unit.
+      i = i:gsub('\237[\160-\191][\128-\191]', REPLACEMENT)
+      local c = {}
+      for k, v in pairs(op) do
+        c[k] = v
+      end
+      c.i = i
+      out[#out + 1] = c
+      changed = changed or i ~= op.i
+    else
+      out[#out + 1] = op
+    end
+  end
+  return out, changed
+end
+
 local function copy(c)
   local result = {}
   for k, v in pairs(c) do

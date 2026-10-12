@@ -268,52 +268,95 @@ async function runTests() {
   // ── Test Suite: Error Handling ───────────────────────────────────
   console.log('\nError Handling:');
 
-  await test('version mismatch triggers otUpdateError', async () => {
+  // Overleaf answers a bad update with otUpdateError(message, { doc_id, ... })
+  // to every client in the project, then disconnects them all.
+  const reconnect = async (client, cookie) => {
+    await client.waitForEvent('disconnect', 2000);
+    await client.request('connect', { cookie, projectId: 'test_project' });
+  };
+
+  await test('version mismatch triggers otUpdateError and a disconnect', async () => {
     bridge.clearEvents();
     const content = '\\documentclass{article}\n\\begin{document}\nHello World\n\\end{document}';
-    try {
-      await bridge.request('applyOtUpdate', {
-        docId: 'doc_main',
-        op: [{ p: 0, i: 'x' }],
-        v: 999, // Wrong version
-        content,
-      });
-    } catch (e) {
-      // Expected - the bridge may throw or the server sends otUpdateError
-    }
-
-    // Check for otUpdateError event
-    try {
-      const evt = await bridge.waitForEvent('otUpdateError', 2000);
-      assert(evt, 'should receive otUpdateError event');
-      assertIncludes(evt.data.message, 'version mismatch', 'error message');
-    } catch (e) {
-      // Also acceptable if the bridge threw the error directly
-    }
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_main',
+      op: [{ p: 0, i: 'x' }],
+      v: 999, // Wrong version
+      content,
+    });
+    const evt = await bridge.waitForEvent('otUpdateError', 2000);
+    assertIncludes(evt.data.message, 'version mismatch', 'error message');
+    assertEqual(evt.data.doc_id, 'doc_main', 'error doc_id');
+    await reconnect(bridge, 'mock_session=test');
+    await bridge.request('joinDoc', { docId: 'doc_main' });
   });
 
-  await test('hash mismatch triggers otUpdateError', async () => {
+  await test('hash mismatch on an untransformed update triggers otUpdateError', async () => {
     bridge.clearEvents();
-    // Send update with correct version but content that produces wrong hash
-    const wrongContent = 'THIS IS WRONG CONTENT';
-    try {
-      await bridge.request('applyOtUpdate', {
-        docId: 'doc_main',
-        op: [{ p: 0, i: 'x' }],
-        v: 2,
-        content: wrongContent, // Hash will be computed from this wrong content
-      });
-    } catch (e) {
-      // Expected
-    }
+    const doc = await bridge.request('joinDoc', { docId: 'doc_main' });
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_main',
+      op: [{ p: 0, i: 'x' }],
+      v: doc.version,
+      content: 'THIS IS WRONG CONTENT', // Hash will be computed from this wrong content
+    });
+    const evt = await bridge.waitForEvent('otUpdateError', 2000);
+    assertIncludes(evt.data.message, 'hash mismatch', 'error message');
+    await reconnect(bridge, 'mock_session=test');
+  });
 
-    try {
-      const evt = await bridge.waitForEvent('otUpdateError', 2000);
-      assert(evt, 'should receive otUpdateError event');
-      assertIncludes(evt.data.message, 'hash mismatch', 'error message');
-    } catch (e) {
-      // Also acceptable
-    }
+  await test('a rejected update errors and disconnects every client in the project', async () => {
+    getOrCreateDoc('doc_boot', ['abc']);
+    const other = new BridgeClient(port);
+    await other.start();
+    await other.request('connect', { cookie: 'mock_session=boot2', projectId: 'test_project' });
+    bridge.clearEvents();
+    await bridge.request('joinDoc', { docId: 'doc_boot' });
+    await bridge.request('applyOtUpdate', { docId: 'doc_boot', op: [{ p: 0, d: 'zzz' }], v: 0, content: null });
+    const mine = await bridge.waitForEvent('otUpdateError', 2000);
+    const theirs = await other.waitForEvent('otUpdateError', 2000);
+    assertEqual(theirs.data.doc_id, 'doc_boot', 'doc_id reaches a client not joined to the doc');
+    assertEqual(mine.data.message, theirs.data.message, 'same message');
+    await other.waitForEvent('disconnect', 2000);
+    other.stop();
+    await reconnect(bridge, 'mock_session=test');
+  });
+
+  await test('the hash is checked only on untransformed updates', async () => {
+    getOrCreateDoc('doc_stale_hash', ['Hello']);
+    await bridge.request('joinDoc', { docId: 'doc_stale_hash' });
+    bridge.clearEvents();
+    await bridge.request('applyOtUpdate', { docId: 'doc_stale_hash', op: [{ p: 0, i: '> ' }], v: 0, content: 'Hello' });
+    await bridge.waitForEvent('otUpdateApplied', 2000);
+    // Stale v, hash of the sender's own view ('Hello!'): accepted after transformation.
+    await bridge.request('applyOtUpdate', { docId: 'doc_stale_hash', op: [{ p: 5, i: '!' }], v: 0, content: 'Hello' });
+    const ack = await bridge.waitForEvent('otUpdateApplied', 2000);
+    assertEqual(ack.data.v, 1, 'applied at v1');
+    const doc = await bridge.request('joinDoc', { docId: 'doc_stale_hash' });
+    assertEqual(doc.lines[0], '> Hello!', 'content');
+  });
+
+  await test('dupIfSource: a resend of an applied op is acked and not applied again', async () => {
+    getOrCreateDoc('doc_dup', ['abc']);
+    const joined = await bridge.request('joinDoc', { docId: 'doc_dup' });
+    bridge.clearEvents();
+    await bridge.request('applyOtUpdate', { docId: 'doc_dup', op: [{ p: 3, i: 'd' }], v: joined.version, content: 'abc' });
+    const first = await bridge.waitForEvent('otUpdateApplied', 2000);
+    const catchup = await bridge.request('joinDoc', { docId: 'doc_dup', fromVersion: joined.version });
+    const publicId = catchup.updates[0].meta.source;
+    await bridge.request('applyOtUpdate', {
+      docId: 'doc_dup',
+      op: [{ p: 3, i: 'd' }],
+      v: joined.version,
+      content: 'abc',
+      dupIfSource: [publicId],
+    });
+    const second = await bridge.waitForEvent('otUpdateApplied', 2000);
+    assertEqual(second.data.v, first.data.v, 'the duplicate is acked with the original version');
+    assert(!Object.prototype.hasOwnProperty.call(second.data, 'op'), 'op-less ack');
+    const doc = await bridge.request('joinDoc', { docId: 'doc_dup' });
+    assertEqual(doc.lines[0], 'abcd', 'applied once');
+    assertEqual(doc.version, joined.version + 1, 'one version');
   });
 
   await test('joinDoc on non-existent doc creates it', async () => {
@@ -586,32 +629,22 @@ async function runTests() {
       content,
     });
 
-    // Client 2 inserts at end (using original v=0, which will cause version mismatch
-    // since client 1 already bumped version to 1)
+    // Client 2's stale version is transformed against client 1's insert.
     bridge2.clearEvents();
-    try {
-      await bridge2.request('applyOtUpdate', {
-        docId: 'doc_concurrent',
-        op: [{ p: 11, i: '!' }],
-        v: 0, // stale version
-        content,
-      });
-    } catch (e) {
-      // Expected: version mismatch
-    }
-
-    // Client 2 should receive either an otUpdateError or version mismatch
-    try {
-      const evt = await bridge2.waitForEvent('otUpdateError', 2000);
-      assert(evt, 'client 2 should get otUpdateError for stale version');
-    } catch (e) {
-      // Also ok if the request itself threw
-    }
+    await bridge2.request('applyOtUpdate', {
+      docId: 'doc_concurrent',
+      op: [{ p: 11, i: '!' }],
+      v: 0,
+      content: null, // a hash of the untransformed content would be stale
+    });
 
     // After client 1's edit, server content should be correct
     const result = await bridge.request('joinDoc', { docId: 'doc_concurrent' });
-    assertEqual(result.lines[0], 'Dear Hello World', 'content after client 1 edit');
-    assertEqual(result.version, 1, 'version after one edit');
+    assertEqual(result.lines[0], 'Dear Hello World!', 'content after both edits');
+    assertEqual(result.version, 2, 'version after two edits');
+    const catchup = await bridge2.request('joinDoc', { docId: 'doc_concurrent', fromVersion: 0 });
+    assertEqual(catchup.updates.length, 2, 'catch-up update count');
+    assertEqual(catchup.updates[1].meta.source !== undefined, true, 'catch-up source');
 
     bridge2.stop();
   });

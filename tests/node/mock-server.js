@@ -9,8 +9,11 @@
  *   - joinProjectResponse on connect
  *   - joinDoc / leaveDoc / applyOtUpdate
  *   - Hash validation (SHA1, git-blob format)
+ *     (checked on untransformed updates only)
  *   - Version tracking per document
- *   - otUpdateError on hash mismatch
+ *   - dupIfSource: a resend whose earlier copy was applied is acked, not applied
+ *   - A rejected update sends otUpdateError(message, { project_id, doc_id,
+ *     error, message }) to every client in the project and disconnects them all
  *   - Broadcasting remote ops to other clients
  */
 
@@ -18,6 +21,10 @@ const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
 const WebSocket = require('ws');
+const text0 = require('ot-json0/lib/text0');
+const HASH_POLICY = process.env.MOCK_HASH_POLICY || 'strict';
+const MESSAGE_DELAY = Number(process.env.MOCK_MESSAGE_DELAY || 0);
+const BOOT_ON_ERROR = process.env.MOCK_BOOT_ON_ERROR !== '0';
 
 // ── In-memory document store ───────────────────────────────────────────
 const docs = {};
@@ -29,6 +36,7 @@ function getOrCreateDoc(docId, lines) {
       version: 0,
       content: (lines || ['']).join('\n'),
       clients: new Set(),
+      history: [],
     };
   }
   return docs[docId];
@@ -159,6 +167,7 @@ class MockClient {
     this.id = nextClientId++;
     this.projectId = projectId;
     this.joinedDocs = new Set();
+    this.deliveryAt = 0;
   }
 
   send(data) {
@@ -207,7 +216,7 @@ class MockClient {
   }
 
   onJoinDoc(args, ackId) {
-    const [docId] = args;
+    const [docId, fromVersion = -1] = args;
     const doc = getOrCreateDoc(docId);
     doc.clients.add(this);
     this.joinedDocs.add(docId);
@@ -219,7 +228,8 @@ class MockClient {
 
     if (ackId) {
       // [error, lines, version, updates, ranges]
-      this.sendAck(ackId, null, encodedLines, doc.version, [], {});
+      const updates = fromVersion < 0 ? [] : doc.history.slice(fromVersion);
+      this.sendAck(ackId, null, encodedLines, doc.version, updates, {});
     }
   }
 
@@ -233,48 +243,86 @@ class MockClient {
     if (ackId) this.sendAck(ackId, null);
   }
 
+  // Like Overleaf: every client in the project gets the error, then the server
+  // disconnects them all ("booted"), not only the sender.
+  rejectUpdate(docId, message) {
+    const peers = [...clients].filter((c) => c.projectId === this.projectId);
+    for (const c of peers) {
+      c.sendEvent('otUpdateError', message, { project_id: this.projectId, doc_id: docId, error: message, message });
+    }
+    if (BOOT_ON_ERROR) {
+      for (const c of peers) c.boot();
+    }
+  }
+
+  boot() {
+    this.send('0::');
+    this.cleanup();
+    setTimeout(() => this.ws.close(), 20);
+  }
+
+  // otUpdateApplied events reach a client in order, each optionally delayed.
+  deliverApplied(payload) {
+    if (MESSAGE_DELAY) {
+      this.deliveryAt = Math.max(Date.now(), this.deliveryAt) + Math.floor(Math.random() * MESSAGE_DELAY) + 1;
+      setTimeout(() => this.sendEvent('otUpdateApplied', payload), this.deliveryAt - Date.now());
+    } else {
+      this.sendEvent('otUpdateApplied', payload);
+    }
+  }
+
   onApplyOtUpdate(args, ackId) {
     const [docId, update] = args;
     receivedUpdates.push({ docId, update });
     const doc = docs[docId];
 
     if (!doc) {
-      this.sendEvent('otUpdateError', { doc: docId, message: 'doc not found' });
       if (ackId) this.sendAck(ackId, { message: 'doc not found' });
+      this.rejectUpdate(docId, 'doc not found');
       return;
     }
 
-    // Version check
-    if (update.v !== doc.version) {
-      this.sendEvent('otUpdateError', {
-        doc: docId,
-        message: `version mismatch: expected ${doc.version}, got ${update.v}`,
-      });
-      if (ackId) this.sendAck(ackId, { message: 'version mismatch' });
+    // The callback acknowledges enqueueing. Ordering and the op-less event follow.
+    if (ackId) this.sendAck(ackId, null);
+    if (update.v > doc.version || update.v < 0) {
+      this.rejectUpdate(docId, `version mismatch: expected ${doc.version}, got ${update.v}`);
       return;
     }
 
-    // Apply ops to document content
-    const ops = update.op || [];
+    // A resend whose earlier copy (sent under one of these public ids) was
+    // applied since update.v: ack it with the original's version, apply nothing.
+    if (Array.isArray(update.dupIfSource)) {
+      for (let v = update.v; v < doc.version; v++) {
+        const source = doc.history[v].meta && doc.history[v].meta.source;
+        if (update.dupIfSource.includes(source)) {
+          this.deliverApplied({ doc: docId, v });
+          return;
+        }
+      }
+    }
+
+    let ops = update.op || [];
     let newContent;
     try {
-      newContent = applyOps(doc.content, ops);
+      for (let v = update.v; v < doc.version; v++) {
+        ops = text0.transform(ops, doc.history[v].op, 'left');
+      }
+      newContent = text0.apply(doc.content, ops);
     } catch (e) {
-      this.sendEvent('otUpdateError', { doc: docId, message: 'op apply failed: ' + e.message });
-      if (ackId) this.sendAck(ackId, { message: 'op apply failed' });
+      this.rejectUpdate(docId, 'op apply failed: ' + e.message);
       return;
     }
 
-    // Hash validation
-    if (update.hash) {
+    // The hash describes the sender's view, so only an untransformed update
+    // can be checked against it.
+    if (update.hash && HASH_POLICY === 'strict' && update.v === doc.version) {
       const expectedHash = computeHash(newContent);
       if (update.hash !== expectedHash) {
         console.log(`[mock] Hash mismatch for ${docId}: got ${update.hash}, expected ${expectedHash}`);
-        this.sendEvent('otUpdateError', {
-          doc: docId,
-          message: `hash mismatch: got ${update.hash.slice(0, 8)}..., expected ${expectedHash.slice(0, 8)}...`,
-        });
-        if (ackId) this.sendAck(ackId, { message: 'hash mismatch' });
+        this.rejectUpdate(
+          docId,
+          `hash mismatch: got ${update.hash.slice(0, 8)}..., expected ${expectedHash.slice(0, 8)}...`
+        );
         return;
       }
     }
@@ -282,24 +330,25 @@ class MockClient {
     // Apply update
     doc.content = newContent;
     doc.lines = newContent.split('\n');
-    doc.version++;
+    const appliedAt = doc.version++;
+    doc.history.push({ v: appliedAt, op: ops, meta: { source: 'mock_public_' + this.id } });
 
     // ACK to sender (no op field = own ACK)
-    this.sendEvent('otUpdateApplied', { doc: docId, v: doc.version });
+    const deliver = (client, payload) => client.deliverApplied(payload);
+    deliver(this, { doc: docId, v: appliedAt });
 
     // Broadcast to other clients (with op field = remote update)
     for (const client of doc.clients) {
       if (client !== this && client.joinedDocs.has(docId)) {
-        client.sendEvent('otUpdateApplied', {
+        deliver(client, {
           doc: docId,
           op: ops,
-          v: update.v, // version the op was applied at
-          meta: { user_id: 'user_' + this.id },
+          v: appliedAt,
+          meta: { user_id: 'user_' + this.id, source: 'mock_public_' + this.id },
         });
       }
     }
 
-    if (ackId) this.sendAck(ackId, null);
   }
 
   cleanup() {

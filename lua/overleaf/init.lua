@@ -117,6 +117,8 @@ M._state = {
   csrf_token = nil,
   root_doc_id = nil, -- project's main document; Overleaf compiles this one
   documents = {}, -- doc_id -> Document
+  public_ids = {}, -- socket ids retained across reconnects for catch-up ACKs
+  public_id = nil, -- the current socket's id
   user_id = nil, -- the signed-in user's id, for per-user project settings
   pdf_path = nil, -- where the last compile's output.pdf landed
   pdf_opened = {}, -- path -> true once a viewer has been launched for it
@@ -308,6 +310,11 @@ function M._connect_project(cookie, project_id, project_name)
     M._state.project_id = project_id
     M._state.project_name = project_name
     M._state.project_data = result.project
+    if result.publicId then
+      M._state.public_ids = M._state.public_ids or {}
+      M._state.public_ids[result.publicId] = true
+      M._state.public_id = result.publicId
+    end
     M._state.root_doc_id = result.project and result.project.rootDoc_id or nil
 
     -- What this session may do depends on the access level the server granted
@@ -440,17 +447,8 @@ function M._setup_event_handlers()
     end
   end
   on_event('otUpdateApplied', function(data)
-    -- Skip own-ACK events (no op field = acknowledgment for our own op)
-    -- Our ACK is already handled by the applyOtUpdate callback → _on_ack()
-    if not data.op then return end
-
     local doc = M._state.documents[data.doc]
-    if doc then
-      doc:on_remote_op(data, function(transformed_ops)
-        buffer.apply_remote(doc, transformed_ops)
-        sync.schedule_write(doc)
-      end)
-    end
+    if doc then doc:receive(data) end
   end)
 
   -- The server pushes this when the main document is changed from any client.
@@ -462,13 +460,22 @@ function M._setup_event_handlers()
     end
   end)
 
+  -- Overleaf sends this to every client in the project and then disconnects
+  -- them all. Only a document with an op in flight can have caused it; the
+  -- rejoin's catch-up (or the reconnect's) finds out whether that op landed, and
+  -- the document gives the op up if it keeps failing.
   on_event('otUpdateError', function(data)
-    config.log('debug', 'OT Error for doc %s: %s', data.doc or '?', data.message or '?')
-    -- Only rejoin if connected (disconnect handler handles reconnect separately)
-    if M._state.connected then
-      local doc = M._state.documents[data.doc]
-      if doc and not doc._rejoining then doc:rejoin() end
+    data = data or {}
+    local doc_id = data.doc_id or data.doc
+    local doc = doc_id and M._state.documents[doc_id]
+    if not (doc and doc.inflight_op) then
+      config.log('debug', 'OT error for doc %s: %s', doc_id or '?', data.message or '?')
+      return
     end
+    config.log('warn', 'Overleaf rejected an edit to %s: %s', doc.path or doc_id, data.message or '?')
+    -- Each rejection disconnects every collaborator: give this op up sooner.
+    doc._inflight_rejected = true
+    if M._state.connected then doc:rejoin() end
   end)
 
   on_event('disconnect', function(data)
@@ -734,6 +741,19 @@ M._reconnect = {
   in_progress = false,
 }
 
+--- Replace the socket now. A document that dropped an unacknowledged op calls
+--- this: on a new socket a late copy of that op arrives as a full op from an old
+--- public id, not as an op-less ACK that would pass for the ACK of the next op.
+---@param reason string
+function M._force_reconnect(reason)
+  if not M._state.connected then return end -- a reconnect is already coming
+  config.log('debug', 'Reconnecting: %s', reason)
+  M._state.connected = false
+  M._reconnect.attempt = 0
+  M._attempt_reconnect()
+  bridge.request('disconnect', {}, function() end)
+end
+
 function M._attempt_reconnect()
   if M._reconnect.in_progress then return end
   if M._state.connected then return end
@@ -806,6 +826,11 @@ function M._reconnect_to_project(cookie)
 
     M._state.connected = true
     M._state.project_data = result.project
+    if result.publicId then
+      M._state.public_ids = M._state.public_ids or {}
+      M._state.public_ids[result.publicId] = true
+      M._state.public_id = result.publicId
+    end
     M._reconnect.attempt = 0
 
     config.log('info', 'Reconnected to: %s', M._state.project_name or '?')
@@ -817,18 +842,7 @@ end
 
 function M._rejoin_documents()
   for _, doc in pairs(M._state.documents) do
-    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-      -- Reset all state for clean rejoin
-      doc._rejoining = false
-      doc.joined = false
-      doc.inflight_op = nil
-      doc.pending_ops = nil
-      if doc._flush_timer then
-        vim.fn.timer_stop(doc._flush_timer)
-        doc._flush_timer = nil
-      end
-      doc:rejoin()
-    end
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then doc:rejoin() end
   end
 end
 
@@ -2173,6 +2187,8 @@ function M._teardown(stop_bridge, callback)
 
   M._state.project_name = nil
   M._state.project_data = nil
+  M._state.public_ids = {}
+  M._state.public_id = nil
   M._state.root_doc_id = nil
   M._state.pdf_path = nil
   M._state.pdf_opened = {}

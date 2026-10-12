@@ -201,7 +201,7 @@ function M.reconcile(doc)
 
   local d = doc._dirty
   if not d then return end
-  if not doc.joined or doc._rejoining then
+  if doc.content == nil then
     doc._dirty = nil
     return
   end
@@ -250,6 +250,9 @@ function M.reconcile(doc)
   local ops = diff.ops(old_text, new_text, ot.byte_to_u16(doc.content, span_offset), { words = mode.tracked() })
   if #ops == 0 then return end
 
+  local replaced
+  ops, replaced = ot.sanitize_inserts(ops)
+
   local ok, updated = pcall(ot.apply, doc.content, ops)
   if not ok then
     config.log('warn', 'reconcile: could not apply local ops to mirror — rejoining')
@@ -258,7 +261,33 @@ function M.reconcile(doc)
   end
   doc.content = updated
   doc:submit_op(ops)
+  if replaced then M._show_replacements(doc) end
   require('overleaf.sync').schedule_write(doc)
+end
+
+--- Overleaf stores characters outside the Basic Multilingual Plane as U+FFFD
+--- (see ot.sanitize_inserts). Show the buffer what was actually stored, or it
+--- would keep text that no collaborator and no compile will ever see.
+function M._show_replacements(doc)
+  if not M._warned_replacement then
+    M._warned_replacement = true
+    config.log(
+      'warn',
+      'Overleaf cannot store emoji or other characters outside the Basic Multilingual Plane; '
+        .. 'they were replaced with U+FFFD, as the Overleaf editor does'
+    )
+  end
+  local text = table.concat(vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false), '\n')
+  local fix = diff.ops(text, doc.content, 0)
+  doc.applying_remote = true
+  local ok = M.apply_ops(doc.bufnr, fix)
+  local err
+  if not ok then
+    ok, err = pcall(vim.api.nvim_buf_set_lines, doc.bufnr, 0, -1, false, vim.split(doc.content, '\n', { plain = true }))
+  end
+  doc.applying_remote = false
+  -- check_content finds the difference later and merges.
+  if not ok then config.log('warn', 'Could not show the replaced characters in %s: %s', doc.path, err) end
 end
 
 --- True while a change has been seen but not yet turned into ops. Callers that
@@ -273,7 +302,7 @@ function M.attach(bufnr, doc)
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function(_, buf, _changedtick, first, _last_old, last_new)
       if doc.applying_remote then return end
-      if not doc.joined then return end
+      if doc.content == nil then return end
 
       mark_dirty(doc, buf, first, last_new)
 
@@ -350,33 +379,41 @@ end
 
 function M.apply_remote(doc, ops)
   if not doc.bufnr or not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
-
-  vim.schedule(function()
-    -- Turn any pending local edit into ops first, so the diff never sees the
-    -- remote text and mistakes it for something this client typed.
-    M.reconcile(doc)
-
-    doc.applying_remote = true
-    local was_modifiable = vim.bo[doc.bufnr].modifiable
-    vim.bo[doc.bufnr].modifiable = true
-
-    local had_error = false
-
-    local applied, apply_err = M.apply_ops(doc.bufnr, ops)
-    if not applied then
-      config.log('error', 'Failed to apply remote op: %s', apply_err)
-      had_error = true
-    end
-
-    -- Fallback: if any op failed, replace buffer entirely from doc.content
-    if had_error and doc.content then
-      config.log('info', 'Falling back to full buffer replace')
-      local new_lines = vim.split(doc.content, '\n', { plain = true })
-      pcall(vim.api.nvim_buf_set_lines, doc.bufnr, 0, -1, false, new_lines)
-    end
-
+  assert(doc._dirty == nil, 'remote apply requires reconciled buffer')
+  doc.applying_remote = true
+  local ok, err = pcall(function()
+    M.unlocked(doc.bufnr, function()
+      local applied, apply_err = M.apply_ops(doc.bufnr, ops)
+      if not applied then error(apply_err) end
+    end)
+  end)
+  if not ok then
+    -- A partly applied op leaves the buffer somewhere between the two texts.
+    -- Bring it to the mirror at once, so `applying_remote` is not held across a tick.
+    config.log('debug', 'Remote buffer apply failed for %s: %s; replacing', doc.path, err)
+    ok, err = pcall(function()
+      M.unlocked(doc.bufnr, function() M.replace_content(doc.bufnr, doc.content) end)
+    end)
+  end
+  if ok then
     vim.bo[doc.bufnr].modified = false
-    vim.bo[doc.bufnr].modifiable = was_modifiable
+    doc.applying_remote = false
+    return
+  end
+  -- Still failing, most likely a textlock (E565): retry on the next tick. Until
+  -- then `applying_remote` stays set, so on_lines does not diff a buffer that
+  -- lacks the remote text against a mirror that has it. A change that does land
+  -- in this window (the textlock forbids most) is overwritten by the replace.
+  config.log('debug', 'Remote buffer replace deferred for %s: %s', doc.path, err)
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(doc.bufnr) then
+      doc.applying_remote = false
+      return
+    end
+    local replaced, replace_err = pcall(function()
+      M.unlocked(doc.bufnr, function() M.replace_content(doc.bufnr, doc.content) end)
+    end)
+    if not replaced then config.log('warn', 'Remote buffer replace failed for %s: %s', doc.path, replace_err) end
     doc.applying_remote = false
   end)
 end

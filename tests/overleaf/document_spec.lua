@@ -176,14 +176,15 @@ describe('document', function()
       assert.is_nil(doc.pending_ops)
     end)
 
-    it('ignores ops when rejoining', function()
+    it('queues ops when rejoining', function()
       local doc = Document.new('test_doc', '/main.tex')
       doc.joined = true
       doc._rejoining = true
+      doc.content = ''
 
       doc:submit_op({ { p = 0, i = 'x' } })
 
-      assert.is_nil(doc.pending_ops)
+      assert.are.same({ { p = 0, i = 'x' } }, doc.pending_ops)
     end)
   end)
 
@@ -269,7 +270,7 @@ describe('document', function()
       assert.are.equal('Hello', doc.content)
     end)
 
-    it('ignores empty ops', function()
+    it('advances the version for an empty broadcast op', function()
       local doc = Document.new('test_doc', '/main.tex')
       doc.joined = true
       doc.version = 5
@@ -279,8 +280,8 @@ describe('document', function()
       local called = false
       doc:on_remote_op({ v = 5, op = {} }, function() called = true end)
 
-      assert.is_false(called)
-      assert.are.equal(5, doc.version)
+      assert.is_true(called)
+      assert.are.equal(6, doc.version)
     end)
   end)
 end)

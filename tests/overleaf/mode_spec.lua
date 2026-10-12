@@ -183,7 +183,14 @@ describe('mode in use', function()
       table.insert(calls, { method = method, params = params })
       if method == 'joinDoc' then
         return callback(nil, { lines = vim.split(content, '\n', { plain = true }), version = 3, ranges = {} })
-      elseif method == 'applyOtUpdate' or method == 'leaveDoc' then
+      elseif method == 'applyOtUpdate' then
+        callback(nil, {})
+        vim.schedule(function()
+          local doc = overleaf._state.documents[params.docId]
+          if doc then doc:receive({ doc = params.docId, v = params.v }) end
+        end)
+        return
+      elseif method == 'leaveDoc' then
         return callback(nil, {})
       elseif method == 'uploadFile' then
         return callback(nil, { success = true, entity_id = 'new_id', entity_type = 'file' })

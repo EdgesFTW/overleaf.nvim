@@ -213,6 +213,46 @@ test with an encoded fixture, and confirm live with a comment on `é` or `😀`.
 
 ## B2b: concurrency and protocol
 
+**Done 2026-10-12.**
+
+Design as shipped (`document.lua`):
+- The in-flight op is never merged into pending, and it remembers every publicId it was sent under.
+- Acks:
+  - an op-less `otUpdateApplied`, or an op whose `meta.source` is one of those ids, is our ack;
+  - events with `v < version` are dropped.
+- Rejoin:
+  - it catches up with `joinDoc(fromVersion)` and recognises our op by `meta.source`;
+  - otherwise the in-flight op is transformed and resent with `dupIfSource` (P3).
+- Limits:
+  - give up after 3 unacked catch-ups, or 2 after an `otUpdateError` (each one boots every
+    collaborator, P5);
+  - giving up saves a recovery file, shows the server text and cycles the socket if the dropped op
+    was sent on it, so a late landing arrives as a foreign op.
+- Failure handling:
+  - the rejoin chain is guarded;
+  - joinDoc errors are retried, and the text merge is used only after 3 catch-up failures;
+  - a failed recovery write keeps the local text in the buffer and stops sending.
+- `ot.sanitize_inserts` rewrites astral characters as U+FFFD (P6).
+
+Verification:
+- **Unit and simulation tests:**
+  - protocol, rejoin and error-event specs;
+  - a two-client simulation with faithful server semantics (dupIfSource, boots, hash only when
+    untransformed, queue stalls, socket drops, watchdogs), clean over 1000 seeds in each mode;
+  - an A/B against the earlier code (47 duplicates, 51 losses).
+- **Two adversarial Opus reviews.**
+- **Live in the sandbox, two clients:**
+  - ASCII and emoji;
+  - 5–80 ms typing;
+  - forced rejoins and socket drops;
+  - insert-only token runs: 0 of 100 lost, against 87 of 100 on the earlier code.
+
+Known limitations:
+- The merge fallback can duplicate an op that is still queued, after 3 failed catch-ups.
+- The merge works at word granularity, so it can overwrite a collaborator's concurrent edit inside
+  a word it rewrites, or turn an emoji next to an edited word into U+FFFD.
+- Comment components in remote ops are not position-transformed.
+
 ### F4: reconcile, transform and buffer apply in one tick
 
 `bridge.lua` ~166-175 already delivers events in order from a scheduled

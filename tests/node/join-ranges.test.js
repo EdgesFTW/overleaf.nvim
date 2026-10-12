@@ -23,5 +23,15 @@ async function main() {
     assert.equal(result.ranges.changes[1].op.d, 'é𝔸');
     console.log(`  [PASS] joinDoc decodes encoded range text (${asString ? 'JSON' : 'object'})`);
   }
+  const manager = new SocketManager('', '', () => {});
+  manager._promisifiedEmit = async (event, docId, fromVersion) => {
+    assert.equal(event, 'joinDoc');
+    assert.equal(docId, 'doc');
+    assert.equal(fromVersion, 2);
+    return [['now'], 3, [{ v: 2, op: [], meta: { source: 'public-id' } }], {}];
+  };
+  const catchup = await manager.joinDoc('doc', 2);
+  assert.deepEqual(catchup.updates, [{ v: 2, op: [], meta: { source: 'public-id' } }]);
+  console.log('  [PASS] joinDoc forwards fromVersion and returns catch-up updates');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

@@ -155,13 +155,18 @@ class SocketManager {
     };
 
     this.socket.on('otUpdateApplied', (update) => {
-      console.log('[otUpdateApplied] doc=' + (update && update.doc) + ' v=' + (update && update.v) + ' hasOp=' + !!(update && update.op));
+      console.log('[otUpdateApplied] doc=' + (update && update.doc) + ' v=' + (update && update.v) + ' hasOp=' + !!(update && Object.prototype.hasOwnProperty.call(update, 'op')));
       this.sendEvent('otUpdateApplied', update);
     });
 
-    this.socket.on('otUpdateError', (err) => {
-      console.log('[otUpdateError]', JSON.stringify(err));
-      this.sendEvent('otUpdateError', err);
+    // Overleaf emits otUpdateError(errorString, { project_id, doc_id, error, message })
+    // to every client in the project, then disconnects them all.
+    this.socket.on('otUpdateError', (err, details) => {
+      console.log('[otUpdateError]', JSON.stringify(err), JSON.stringify(details));
+      const info = details && typeof details === 'object' ? details : {};
+      const first = err && typeof err === 'object' ? err : {};
+      const message = (typeof err === 'string' ? err : first.message) || info.message || String(err);
+      this.sendEvent('otUpdateError', { message, doc_id: info.doc_id || first.doc_id || first.doc });
     });
 
     this.socket.on('disconnect', (reason) => {
@@ -256,9 +261,8 @@ class SocketManager {
     });
   }
 
-  async joinDoc(docId) {
-    // Explicitly pass fromVersion=-1 to get full document (no incremental ops)
-    const data = await this._promisifiedEmit('joinDoc', docId, -1, { encodeRanges: true });
+  async joinDoc(docId, fromVersion = -1) {
+    const data = await this._promisifiedEmit('joinDoc', docId, fromVersion, { encodeRanges: true });
     // data = [docLines[], version, updates, ranges]
     const [docLines, version, updates, ranges] = data;
 
@@ -303,7 +307,7 @@ class SocketManager {
       }
     }
 
-    return { lines, version, ranges: decodedRanges };
+    return { lines, version, updates: updates || [], ranges: decodedRanges };
   }
 
   async leaveDoc(docId) {
@@ -316,13 +320,19 @@ class SocketManager {
   // reads `meta.tc` -- an id seed -- to decide whether an update is a tracked
   // change, and derives each change's id from it. A seed reused by two updates
   // would give their changes the same ids, so every update gets its own.
-  async applyOtUpdate(docId, op, version, content, tracked) {
+  // `dupIfSource` (a resend only): the public ids an earlier copy of this op was
+  // sent under. The server acks instead of applying it if such a copy was
+  // applied since `version`.
+  async applyOtUpdate(docId, op, version, content, tracked, dupIfSource) {
     const update = {
       doc: docId,
       op: op,
       v: version,
       lastV: version,
     };
+    if (Array.isArray(dupIfSource) && dupIfSource.length > 0) {
+      update.dupIfSource = dupIfSource;
+    }
     if (tracked) {
       update.meta = { tc: crypto.randomBytes(9).toString('hex') };
     }

@@ -3,6 +3,7 @@
 local config = require('overleaf.config')
 local bridge = require('overleaf.bridge')
 local diff = require('overleaf.diff')
+local ot = require('overleaf.ot')
 local mode = require('overleaf.mode')
 
 local M = {}
@@ -380,7 +381,8 @@ function M._sync_closed_doc(doc, new_content)
     -- Only the words that differ. Deleting the whole document and typing it
     -- back would wipe every comment and suggestion in it, because Overleaf drops
     -- those anchored to any text an op deletes.
-    local ops = diff.ops(server_content, new_content, 0, { words = mode.tracked() })
+    local ops, replaced = ot.sanitize_inserts(diff.ops(server_content, new_content, 0, { words = mode.tracked() }))
+    if replaced then new_content = ot.apply(server_content, ops) end
 
     bridge.request('applyOtUpdate', {
       docId = doc.doc_id,
@@ -397,6 +399,11 @@ function M._sync_closed_doc(doc, new_content)
         doc.content = new_content
         doc.server_content = new_content
         doc.version = (version or 0) + 1
+        -- Emoji were stored as U+FFFD; put what Overleaf has back on disk.
+        if replaced then
+          config.log('warn', 'Characters outside the Basic Multilingual Plane in %s were stored as U+FFFD', doc.path)
+          M.schedule_write(doc)
+        end
       end
 
       -- Leave the doc

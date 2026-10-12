@@ -249,14 +249,15 @@ describe('buffer', function()
       assert.are.equal('Hello World', doc.content)
     end)
 
-    it('ignores changes when doc is not joined', function()
+    it('ignores changes before the first join has content', function()
       doc.joined = false
+      doc.content = nil
       vim.api.nvim_buf_set_text(bufnr, 0, 0, 0, 0, { 'X' })
       settle()
       doc.joined = true
 
       assert.are.equal(0, #doc._submitted_ops)
-      assert.are.equal('Hello World', doc.content)
+      assert.is_nil(doc.content)
     end)
   end)
 
