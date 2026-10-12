@@ -194,6 +194,12 @@ README already says this happens for fileRefs.
 
 ## Also planned: file tree order (independent of the phases above)
 
+**Done 2026-10-12.** Overleaf's web tree (`file-tree-folder-list.tsx`, `util/file-collator.ts`) lists
+subfolders first, then docs and files interleaved, sorted by
+`Intl.Collator('en', {numeric: true, sensitivity: 'variant', caseFirst: 'upper'})`. The plugin
+approximates that, with accented letters in byte order. The main document is marked `*`, and
+`tree_sort = 'overleaf'` keeps storage order.
+
 **Problem.** The tree panel (`lua/overleaf/tree.lua`) draws `project._project_tree`
 exactly as stored, and nothing in the plugin sorts it:
 
