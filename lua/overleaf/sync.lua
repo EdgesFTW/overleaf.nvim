@@ -85,6 +85,134 @@ local function write_bytes(path, data)
   return true
 end
 
+-- ── Offline-edit manifest (mirror Phase 4, decision D5) ──────────────────
+
+-- doc path -> sha256 of the last content the plugin wrote to (or accepted as
+-- in sync on) that document's mirror file. It lives under stdpath('state'),
+-- not in the mirror, so an agent that can write the mirror cannot forge it.
+-- On connect it tells who changed a file while the plugin was away.
+-- Short: a manifest that lags the disk when Neovim dies can mistake a
+-- collaborator reverting the document for an offline edit.
+local MANIFEST_DEBOUNCE_MS = 50
+M._manifest = nil -- nil without a project id (then offline edits are not tracked)
+M._manifest_id = nil
+M._manifest_new = false
+M._manifest_dirty = false
+M._manifest_timer = nil
+
+function M._manifest_dir() return vim.fn.stdpath('state') .. '/overleaf' end
+
+-- Per project and mirror directory: two instances mirroring one project into
+-- different directories must not overwrite each other's record.
+local function manifest_file(project_id)
+  local dir_tag = vim.fn.sha256(M._sync_dir or ''):sub(1, 12)
+  return M._manifest_dir() .. '/' .. (project_id:gsub('[^%w%-_]', '_')) .. '-' .. dir_tag .. '.json'
+end
+
+--- Write the manifest now if it changed. Atomic and private to the user.
+function M.flush_manifest()
+  if M._manifest_timer then
+    vim.fn.timer_stop(M._manifest_timer)
+    M._manifest_timer = nil
+  end
+  if not (M._manifest and M._manifest_file and M._manifest_dirty) then return end
+  -- A new record is first saved complete, after the first full sync: a
+  -- partial one would make the files it misses look like conflicts.
+  if M._manifest_new then return end
+  local file = M._manifest_file
+  vim.fn.mkdir(M._manifest_dir(), 'p', SYNC_DIR_MODE)
+  local tmp_path = file .. '.tmp.' .. vim.uv.getpid()
+  local fd = vim.uv.fs_open(tmp_path, 'w', tonumber('600', 8))
+  local ok = fd ~= nil
+  if fd then
+    local json = vim.json.encode({ version = 1, project_id = M._manifest_id, docs = M._manifest })
+    ok = vim.uv.fs_write(fd, json) ~= nil
+    vim.uv.fs_close(fd)
+    if ok then
+      local renamed, err = os.rename(tmp_path, file)
+      if not renamed then
+        config.log('warn', 'Could not save the offline-edit manifest %s: %s', file, tostring(err))
+        ok = false
+      end
+    end
+    if not ok then os.remove(tmp_path) end
+  else
+    config.log('warn', 'Could not save the offline-edit manifest %s', file)
+  end
+  if ok then M._manifest_dirty = false end
+end
+
+--- Read the manifest for `project_id`, replacing what was loaded. A manifest
+--- that exists but cannot be read counts as empty (every differing file is
+--- then a conflict, which keeps both versions); a missing one as new.
+---@param project_id string|nil
+local function manifest_open(project_id)
+  if M._manifest and M._manifest_id == project_id then return end
+  M.flush_manifest()
+  M._manifest, M._manifest_id, M._manifest_dirty = nil, nil, false
+  if not project_id then return end
+  M._manifest, M._manifest_id = {}, project_id
+  local file = manifest_file(project_id)
+  M._manifest_file = file
+  local data = read_bytes(file)
+  if not data and vim.uv.fs_stat(file) then
+    config.log('warn', 'The offline-edit manifest %s is unreadable; treating it as empty', file)
+    return
+  end
+  -- No manifest yet (the first connect with this version, or a new mirror):
+  -- nothing tells an offline edit from a stale file, and before the mirror
+  -- followed closed documents most differing files are stale. Keep the old
+  -- behaviour, overwriting with the server text, until there is a record.
+  M._manifest_new = not data
+  if not data then return end
+  local ok, decoded = pcall(vim.json.decode, data)
+  if not (ok and type(decoded) == 'table' and type(decoded.docs) == 'table') then
+    config.log('warn', 'The offline-edit manifest %s is unreadable; treating it as empty', file)
+    return
+  end
+  for path, sha in pairs(decoded.docs) do
+    if type(path) == 'string' and type(sha) == 'string' then M._manifest[path] = sha end
+  end
+end
+
+local function manifest_changed()
+  M._manifest_dirty = true
+  if M._manifest_timer then return end
+  M._manifest_timer = vim.fn.timer_start(MANIFEST_DEBOUNCE_MS, function()
+    M._manifest_timer = nil
+    M.flush_manifest()
+  end)
+end
+
+--- Note that the mirror file at `path` (a document) now holds `content`.
+local function manifest_set(path, content)
+  if not (M._manifest and M._sync_dir) then return end
+  local key = path:sub(#M._sync_dir + 2)
+  local sha = vim.fn.sha256(content)
+  if M._manifest[key] == sha then return end
+  M._manifest[key] = sha
+  manifest_changed()
+end
+
+local function manifest_move(from, to)
+  if not (M._manifest and M._manifest[from]) then return end
+  M._manifest[to], M._manifest[from] = M._manifest[from], nil
+  manifest_changed()
+end
+
+local function manifest_drop(key)
+  if not (M._manifest and M._manifest[key]) then return end
+  M._manifest[key] = nil
+  manifest_changed()
+end
+
+--- Record that a document's mirror file holds `content`, as far as the plugin
+--- knows: the bytes its own watcher echo is recognised by, and the manifest.
+local function remember(path, content)
+  M._last_written[path] = content
+  manifest_set(path, content)
+end
+
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
 function M.start(project_name)
@@ -105,6 +233,8 @@ end
 --- Stop all watchers and timers
 function M.stop()
   M._generation = M._generation + 1
+  M.flush_manifest()
+  M._manifest, M._manifest_id = nil, nil
   for _, handle in pairs(M._dir_watchers) do
     if not handle:is_closing() then
       handle:stop()
@@ -212,7 +342,7 @@ function M.write_doc(doc)
   -- Already there: leave the file alone, so a tool that checks the file's
   -- modification time before editing does not see a change that is not one.
   if on_disk == doc.content then
-    M._last_written[path] = on_disk
+    remember(path, on_disk)
     if M._deleted[path] then
       M._deleted[path] = nil
       M.watch(doc)
@@ -256,7 +386,7 @@ function M._write_text(doc, content)
   end
 
   if renamed then
-    M._last_written[path] = content
+    remember(path, content)
     -- Our rename() replaces the inode, so re-watch here. External renames are
     -- handled in watch, which re-arms before processing their event.
     if M._watchers[path] or M._deleted[path] then
@@ -344,6 +474,8 @@ function M.unwatch(doc, cancel_write)
   end
 
   local path = M._sync_dir .. '/' .. doc.path
+  -- Only a deletion cancels the write: the document is gone from the project.
+  if cancel_write then manifest_drop(doc.path) end
   local w = M._watchers[path]
   if w then
     if w.handle and not w.handle:is_closing() then
@@ -382,6 +514,7 @@ function M.move_doc(old_path, doc)
   M._last_written[to], M._last_written[from] = M._last_written[from], nil
   M._deleted[to], M._deleted[from] = M._deleted[from], nil
   M._held[to], M._held[from] = M._held[from], nil
+  manifest_move(old_path, doc.path)
   if watcher then M.watch(doc) end
 end
 
@@ -542,7 +675,7 @@ local function sync_live_doc(path, doc, mine)
     -- The disk holds the document's text. Record it as the in-sync state,
     -- otherwise a later edit that restores the bytes we last wrote ourselves
     -- (an undo, a revert) would look like our own echo and be dropped.
-    M._last_written[path] = mine
+    remember(path, mine)
   end
   -- Catches a later external save whose watcher event is lost (see write_doc).
   M.schedule_write(doc)
@@ -565,7 +698,7 @@ function M._on_file_changed(path, doc)
 
   -- No change
   if mine == doc.content then
-    M._last_written[path] = mine
+    remember(path, mine)
     return
   end
 
@@ -691,6 +824,7 @@ function M._sync_closed_doc(doc, new_content, callback)
     local version = result.version
     if new_content == theirs then
       snapshot(theirs, version)
+      manifest_set(path, theirs)
       leave()
       return
     end
@@ -733,7 +867,11 @@ function M._sync_closed_doc(doc, new_content, callback)
           config.log('warn', 'Characters outside the Basic Multilingual Plane in %s were stored as U+FFFD', doc.path)
         end
         -- The writer's file gets what Overleaf now has.
-        if merged ~= new_content then M._write_text(doc, merged) end
+        if merged ~= new_content then
+          M._write_text(doc, merged)
+        else
+          manifest_set(path, merged)
+        end
       end
       leave(ot_err)
     end)
@@ -1021,7 +1159,7 @@ function M._import_new_file(path, state)
             return
           end
           M._held[path] = nil
-          M._last_written[path] = data
+          remember(path, data)
           M._sync_joined_doc(doc, data)
           M.watch(doc)
         end)
@@ -1435,6 +1573,69 @@ function M.upload_file(entry, local_path, data, callback, state_override)
   end)
 end
 
+--- Decision D5: a mirror file that differs from the server on connect may hold
+--- edits made while the plugin was away. The manifest says who changed it.
+--- Returns false when the file must not be written over this time.
+---@param doc table Document instance, joined and with its server text
+---@return boolean
+local function reconcile_offline(doc)
+  local path = M.file_path(doc.path)
+  if not M._manifest or doc.content == nil or M._last_written[path] ~= nil then return true end
+  local on_disk = read_bytes(path)
+  if on_disk == nil or on_disk == doc.content then return true end
+  local known = M._manifest[doc.path]
+  if not known and M._manifest_new then return true end
+  if on_disk == '' then
+    -- Nothing worth a conflict copy, and emptying a whole document is more
+    -- likely an accident (or a half-written save) than an edit to send.
+    config.log(
+      'warn',
+      '%s was emptied while Overleaf was not connected; it now holds the Overleaf text again',
+      doc.path
+    )
+    return true
+  end
+  -- Only the server changed since the plugin last wrote the file.
+  if known and vim.fn.sha256(on_disk) == known then return true end
+  if known and vim.fn.sha256(doc.content) == known then
+    -- Only the disk changed. The server text is the base the edit was made
+    -- from, so it goes through the usual external-edit path: mode-gated
+    -- (viewing holds it, suggesting tracks it), shown in the buffer and
+    -- written back where Overleaf stored it differently.
+    config.log('info', '%s was edited while Overleaf was not connected; sending the edit', doc.path)
+    M._last_written[path] = doc.content
+    if not is_live(doc) then
+      -- A snapshot cannot take the edit now. It stays on disk, held, and is
+      -- merged when the document rejoins (see write_doc).
+      hold_unsynced(path, doc)
+      return false
+    end
+    M._on_file_changed(path, doc)
+    return true
+  end
+  -- Both sides changed, or there is no record to tell (an unknown file that
+  -- differs is a conflict too): keep the disk version next to the file.
+  local copy = conflict_path(path)
+  if write_bytes(copy, on_disk) then
+    config.log(
+      'warn',
+      '%s differs from Overleaf and the plugin cannot tell which side changed it. '
+        .. '%s now holds the Overleaf text and the disk version is in %s',
+      doc.path,
+      doc.path,
+      copy
+    )
+    return true
+  end
+  config.log(
+    'error',
+    '%s differs from Overleaf and the disk version could not be saved to %s. The file was left as it is',
+    doc.path,
+    copy
+  )
+  return false
+end
+
 --- Sync all project documents and files to disk
 ---@param state table M._state from init.lua
 ---@param project_tree table[] project._project_tree
@@ -1444,10 +1645,16 @@ function M.sync_all(state, project_tree, callback)
     if callback then callback() end
     return
   end
+  manifest_open(state.project_id)
+  local sync_generation = M._generation
 
   local docs = {}
   local files = {}
   local function finish()
+    if M._manifest_new and M._generation == sync_generation then
+      M._manifest_new = false
+      M.flush_manifest()
+    end
     if new_files_enabled() then
       M._new_file_state = state
       M.scan_new_files(state)
@@ -1517,7 +1724,7 @@ function M.sync_all(state, project_tree, callback)
       doc.content = content
       doc.server_content = content
       doc.version = result.version
-      M.write_doc(doc)
+      if reconcile_offline(doc) then M.write_doc(doc) end
       M.watch(doc)
       bridge.request('leaveDoc', { docId = doc.doc_id }, function() on_done() end)
     end)
@@ -1528,7 +1735,7 @@ function M.sync_all(state, project_tree, callback)
     local open = doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr)
     if doc and doc.content ~= nil and (doc.joined or doc._rejoining or open) then
       -- Already joined, just write
-      M.write_doc(doc)
+      if reconcile_offline(doc) then M.write_doc(doc) end
       M.watch(doc)
       on_done()
     else
@@ -1555,7 +1762,7 @@ function M.sync_all(state, project_tree, callback)
           snapshot(doc)
           return
         end
-        M.write_doc(doc)
+        if reconcile_offline(doc) then M.write_doc(doc) end
         M.watch(doc)
         on_done()
       end)

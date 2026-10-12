@@ -351,6 +351,18 @@ Disk deletions and renames are never sent to Overleaf automatically.
   - the merge assumes the writer read the file just before writing it, as
     Claude Code does. A tool that writes back a copy it read long ago undoes
     whatever changed since, as any editor would.
+- **Edits made while not connected**: on connect, the plugin compares each
+  document's file with the Overleaf text and with a hash of what it last wrote
+  there (kept per project under Neovim's state directory, not in the mirror):
+  - only Overleaf changed: the file is overwritten;
+  - only the file changed: its edit is sent to Overleaf like any external edit
+    (held in viewing mode, tracked in suggesting mode);
+  - both changed, or the plugin has no record of the file: the file is saved as
+    `<file>.overleaf-conflict.<n>`, the Overleaf text is written, and a warning
+    names both.
+  The record starts on the first connect with this version. Until then the
+  plugin cannot tell an offline edit from a stale file, so it overwrites as
+  before.
 - If Overleaf refuses to join a document, a warning says so and that file is
   only a snapshot: it does not follow remote edits until the next
   `:Overleaf sync`, and a disk edit to it is merged against a fresh copy from

@@ -224,6 +224,35 @@ Behind decision D3; off by default.
 
 ## Phase 4 (optional): offline edits
 
+**Done 2026-10-12**, in the reduced form of decision D5, and live-checked in the sandbox
+(offline edit sent; both sides changed gives a conflict copy; server-only change overwrites).
+
+The manifest:
+- lives at `stdpath('state')/overleaf/<project_id>-<sync dir hash>.json`, not in the mirror;
+- holds a sha256 per document path, mode 0600;
+- is written atomically, 50 ms after a change and on disconnect and `VimLeavePre`.
+
+On connect, before `sync_all` writes a document:
+- disk equals server: nothing;
+- disk matches the manifest: the server wins;
+- the server matches the manifest: the disk edit goes through the usual external-edit path
+  (viewing holds it, suggesting tracks it);
+- a file emptied offline gets the server text back, with a warning;
+- otherwise a conflict copy of the disk version is kept, and a warning names both files.
+
+Edge rules:
+- With no manifest yet (the first connect after upgrading), differing files are overwritten
+  as before. The new record is saved only once the first full sync completes.
+- A manifest that exists but cannot be read counts as empty, which yields conflict copies.
+- Renames move an entry and deletions drop it. FileRefs are unchanged.
+
+Known limits:
+- If Neovim dies within 50 ms of a mirror write, the manifest lags the disk. A collaborator
+  then reverting to exactly the previous text looks like an offline edit.
+- If the conflict copy cannot be written (but the file can), the next mirror write overwrites
+  the disk version.
+- Two instances on one mirror directory overwrite each other's manifest.
+
 Persist `{ path -> sha1 of last content written }` to `<sync_dir>/<project>/.overleaf-sync.json`
 (mode 0600) on every `write_doc`. On connect, before `sync_all` overwrites a file,
 compare the disk sha with the manifest. If they differ, the file was edited while

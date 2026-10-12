@@ -155,7 +155,10 @@ function M.setup(opts)
   local group = vim.api.nvim_create_augroup('OverleafViewerState', { clear = true })
   vim.api.nvim_create_autocmd('VimLeavePre', {
     group = group,
-    callback = function() remove_server_state(M._state.pdf_path) end,
+    callback = function()
+      remove_server_state(M._state.pdf_path)
+      sync.flush_manifest()
+    end,
   })
 end
 
