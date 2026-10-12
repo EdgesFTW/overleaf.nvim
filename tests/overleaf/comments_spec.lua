@@ -3,6 +3,7 @@
 -- view of them does too -- what is highlighted, and which thread "read the
 -- comment at the cursor" finds.
 local comments = require('overleaf.comments')
+local ot = require('overleaf.ot')
 
 local DOC = 'doc_c'
 local TEXT = 'alpha line\nThe quick brown fox jumps.\nomega line'
@@ -10,7 +11,7 @@ local TEXT = 'alpha line\nThe quick brown fox jumps.\nomega line'
 --- Comment on "quick brown fox", as joinDoc reports it: a character offset.
 local function ranges_for(text, needle, thread)
   local start = text:find(needle, 1, true) - 1
-  local chars = vim.str_utfindex(text:sub(1, start), 'utf-32')
+  local chars = ot.byte_to_u16(text, start)
   return { comments = { { id = 'c_' .. thread, op = { c = needle, p = chars, t = thread } } } }
 end
 
@@ -69,6 +70,14 @@ describe('comments', function()
       bufnr = open(text, ranges_for(text, 'zażółć gęślą jaźń', 't1'))
       local h = highlight(bufnr)
       assert.are.equal('zażółć gęślą jaźń', vim.api.nvim_buf_get_text(bufnr, h[1], h[2], h[3], h[4], {})[1])
+    end)
+
+    it('places and measures a comment after astral text', function()
+      local text = '😀 é 𝔸 end'
+      bufnr = open(text, ranges_for(text, '𝔸', 't1'))
+      assert.are.equal(5, comments._doc_comments[DOC][1].offset)
+      assert.are.equal(2, comments._doc_comments[DOC][1].length)
+      assert.are.same({ 0, 8, 0, 12 }, highlight(bufnr))
     end)
   end)
 

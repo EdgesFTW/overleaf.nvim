@@ -8,7 +8,7 @@ local ot = require('overleaf.ot')
 local function churn(ops)
   local n = 0
   for _, op in ipairs(ops) do
-    n = n + ot.utf8_len(op.d or op.i or '')
+    n = n + ot.u16_len(op.d or op.i or '')
   end
   return n
 end
@@ -31,6 +31,13 @@ describe('diff.ops', function()
   it('reproduces the new text', function()
     local new = doc:gsub('brown', 'red')
     assert.are.equal(new, ot.apply(doc, diff.ops(doc, new)))
+  end)
+
+  it('uses UTF-16 positions after an astral character', function()
+    local old, new = 'a𝔸b', 'a𝔸Xb'
+    local ops = diff.ops(old, new)
+    assert.are.same({ { p = 3, i = 'X' } }, ops)
+    assert.are.equal(new, ot.apply(old, ops))
   end)
 
   describe('leaves untouched text alone', function()
@@ -253,8 +260,7 @@ describe('diff.ops', function()
           while suffix < math.min(#old, #new) - prefix and old:byte(#old - suffix) == new:byte(#new - suffix) do
             suffix = suffix + 1
           end
-          local naive = ot.utf8_len(old:sub(prefix + 1, #old - suffix))
-            + ot.utf8_len(new:sub(prefix + 1, #new - suffix))
+          local naive = ot.u16_len(old:sub(prefix + 1, #old - suffix)) + ot.u16_len(new:sub(prefix + 1, #new - suffix))
           -- Byte-level trimming can split a multibyte character, so allow for it.
           assert.is_true(churn(diff.ops(old, new)) <= naive + 8)
         end

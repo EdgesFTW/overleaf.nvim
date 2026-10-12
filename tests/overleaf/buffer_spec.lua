@@ -6,7 +6,9 @@ local test_counter = 0
 
 -- Buffer changes are reconciled into ops on the next event-loop tick, so tests
 -- must let that run before asserting on the ops that were produced.
-local function settle() vim.wait(50, function() return false end) end
+local function settle()
+  vim.wait(50, function() return false end)
+end
 
 -- Minimal mock document for testing buffer creation and on_bytes
 local function make_doc(content, path)
@@ -315,7 +317,7 @@ describe('buffer', function()
 
       assert.are.equal(1, #doc._submitted_ops)
       local ops = doc._submitted_ops[1]
-      assert.are.equal(2, ops[1].p)
+      assert.are.equal(3, ops[1].p)
       assert.are.equal('X', ops[1].i)
       assert.are.equal('A😀XB', doc.content)
 
@@ -370,6 +372,15 @@ describe('buffer', function()
   end)
 
   describe('apply_remote', function()
+    it('rejects a deletion that differs from the buffer', function()
+      local buf = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { 'abc' })
+      local ok = buffer.apply_ops(buf, { { p = 1, d = 'x' } })
+      assert.is_false(ok)
+      assert.are.same({ 'abc' }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
     it('applies remote insert to buffer', function()
       local content = 'Hello World'
       local doc = make_doc(content)
@@ -453,7 +464,7 @@ describe('buffer', function()
   -- These tests verify what happens when doc.content and buffer have
   -- diverged. In this state, on_bytes generates WRONG ops because:
   --   1. byte_offset from Neovim is relative to buffer content
-  --   2. byte_to_char(doc.content, byte_offset) uses wrong content
+  --   2. byte_to_u16(doc.content, byte_offset) uses wrong content
   --   3. doc.content:sub() extracts wrong deleted text
   --
   -- Root causes of divergence:
@@ -480,9 +491,7 @@ describe('buffer', function()
       return doc, buf
     end
 
-    local function buf_text(buf)
-      return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
-    end
+    local function buf_text(buf) return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n') end
 
     --- Edit, let reconciliation run, and assert the mirror caught up.
     local function assert_converges(doc, buf, edit)

@@ -1,4 +1,5 @@
 local _ = require('overleaf.config')
+local ot = require('overleaf.ot')
 
 local M = {}
 
@@ -101,7 +102,7 @@ function M._render_cursor(user_id, collab)
 
   -- Clamp column to line length
   local line_text = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ''
-  local col = math.max(0, math.min(collab.col, #line_text))
+  local col = ot.u16_to_byte_floor(line_text, math.max(0, math.min(collab.col, ot.u16_len(line_text))))
 
   local hl_cursor = 'OverleafCursor' .. collab.color_idx
   local hl_name = 'OverleafCursorName' .. collab.color_idx

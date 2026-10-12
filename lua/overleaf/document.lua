@@ -248,14 +248,11 @@ function Document:on_remote_op(update, apply_to_buffer)
     local ops_to_apply = remote_ops
 
     if self.inflight_op then
-      ops_to_apply = ot.transform_ops(remote_ops, self.inflight_op, 'right')
-      self.inflight_op = ot.transform_ops(self.inflight_op, remote_ops, 'left')
+      self.inflight_op, ops_to_apply = ot.transform_x(self.inflight_op, ops_to_apply)
     end
 
     if self.pending_ops then
-      local ops_for_pending = ops_to_apply
-      ops_to_apply = ot.transform_ops(ops_to_apply, self.pending_ops, 'right')
-      self.pending_ops = ot.transform_ops(self.pending_ops, ops_for_pending, 'left')
+      self.pending_ops, ops_to_apply = ot.transform_x(self.pending_ops, ops_to_apply)
     end
 
     self.version = self.version + 1

@@ -9,9 +9,8 @@
 --
 -- The ops come back in DESCENDING position order with non-overlapping hunks.
 -- That makes each one valid against the original text however many there are
--- (a later position never shifts an earlier one), and it is what lets
--- ot.transform_ops, which transforms components independently, stay correct
--- for a list of them.
+-- (a later position never shifts an earlier one). The OT engine transforms
+-- these sequential components as a list.
 local ot = require('overleaf.ot')
 
 local M = {}
@@ -132,7 +131,7 @@ local function build(old, new, words)
     b = new:sub(prefix + 1, #new - suffix)
   end
 
-  local origin = ot.byte_to_char(old, prefix)
+  local origin = ot.byte_to_u16(old, prefix)
 
   if a == '' or b == '' then return single_hunk(a, b, origin) end
 
@@ -203,7 +202,7 @@ local function build(old, new, words)
     local from_b = byte_of(sb, #b, ib)
     local to_b = byte_of(sb, #b, jb)
 
-    cur_char = cur_char + ot.utf8_len(a:sub(cur_byte + 1, from_a))
+    cur_char = cur_char + ot.u16_len(a:sub(cur_byte + 1, from_a))
     cur_byte = from_a
 
     located[#located + 1] = {

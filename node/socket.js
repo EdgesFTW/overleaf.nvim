@@ -278,6 +278,23 @@ class SocketManager {
       }
     }
 
+    // encodeRanges also Latin-1-encodes text inside range operations.
+    if (decodedRanges && typeof decodedRanges === 'object') {
+      for (const comment of decodedRanges.comments || []) {
+        if (comment.op && typeof comment.op.c === 'string') {
+          comment.op.c = Buffer.from(comment.op.c, 'latin1').toString('utf-8');
+        }
+      }
+      for (const change of decodedRanges.changes || []) {
+        if (!change.op) continue;
+        for (const key of ['i', 'd']) {
+          if (typeof change.op[key] === 'string') {
+            change.op[key] = Buffer.from(change.op[key], 'latin1').toString('utf-8');
+          }
+        }
+      }
+    }
+
     console.log('joinDoc ranges keys:', decodedRanges ? Object.keys(decodedRanges) : 'null');
     if (decodedRanges && decodedRanges.comments) {
       console.log('joinDoc comments count:', decodedRanges.comments.length);

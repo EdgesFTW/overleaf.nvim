@@ -66,8 +66,8 @@ function M.parse_ranges(doc_id, ranges)
     if op and op.t then
       table.insert(M._doc_comments[doc_id], {
         threadId = op.t,
-        offset = op.p or 0, -- character offset in document
-        length = op.c and ot.utf8_len(op.c) or 0,
+        offset = op.p or 0, -- UTF-16 offset in document
+        length = op.c and ot.u16_len(op.c) or 0,
         content = op.c or '',
       })
       config.log(
@@ -75,18 +75,17 @@ function M.parse_ranges(doc_id, ranges)
         'Comment: thread=%s offset=%d len=%d text="%s"',
         op.t,
         op.p or 0,
-        op.c and ot.utf8_len(op.c) or 0,
+        op.c and ot.u16_len(op.c) or 0,
         (op.c or ''):sub(1, 30)
       )
     end
   end
 end
 
---- Convert a character offset to a 1-based line and a 0-based BYTE column.
---- Overleaf counts characters; Neovim addresses text by byte, so a multibyte
---- character before the offset must not be read as several.
+--- Convert a UTF-16 offset to a 1-based line and a 0-based BYTE column.
+--- Overleaf counts UTF-16 units; Neovim addresses text by byte.
 local function offset_to_pos(content, offset)
-  local byte = ot.char_to_byte(content, math.max(offset, 0))
+  local byte = ot.u16_to_byte_floor(content, math.max(offset, 0))
   local line, line_start = 1, 0
   local pos = content:find('\n', 1, true)
   while pos and pos <= byte do
@@ -97,7 +96,7 @@ local function offset_to_pos(content, offset)
   return line, byte - line_start
 end
 
---- Character offset of a buffer position (0-based row, byte column).
+--- UTF-16 offset of a buffer position (0-based row, byte column).
 local function pos_to_offset(bufnr, row, col)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, row + 1, false)
   local byte = 0
@@ -106,7 +105,7 @@ local function pos_to_offset(bufnr, row, col)
   end
   byte = byte + col
   local text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-  return ot.byte_to_char(text, math.min(byte, #text))
+  return ot.byte_to_u16(text, math.min(byte, #text))
 end
 
 --- The highlight extmarks are what actually follow the text as it is edited, so

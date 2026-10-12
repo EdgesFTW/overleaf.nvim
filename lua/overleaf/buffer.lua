@@ -247,7 +247,7 @@ function M.reconcile(doc)
   -- not delete and re-insert the text between them: Overleaf drops any comment
   -- or suggestion anchored to text an op deletes, even if it is put straight back.
   local span_offset = line_start_offset(mirror_lines, m_first)
-  local ops = diff.ops(old_text, new_text, ot.byte_to_char(doc.content, span_offset), { words = mode.tracked() })
+  local ops = diff.ops(old_text, new_text, ot.byte_to_u16(doc.content, span_offset), { words = mode.tracked() })
   if #ops == 0 then return end
 
   local ok, updated = pcall(ot.apply, doc.content, ops)
@@ -312,15 +312,17 @@ function M.apply_ops(bufnr, ops)
     local ok, err = pcall(function()
       if op.d then
         local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-        -- Convert character offset to byte offset for Neovim
-        local byte_p = ot.char_to_byte(buf_content, op.p)
+        local byte_p = ot.u16_to_byte(buf_content, op.p)
+        if buf_content:sub(byte_p + 1, byte_p + #op.d) ~= op.d then
+          error('Delete component does not match buffer text')
+        end
         local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
         local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
         vim.api.nvim_buf_set_text(bufnr, start_row, start_col, end_row, end_col, { '' })
       end
       if op.i then
         local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-        local byte_p = ot.char_to_byte(buf_content, op.p)
+        local byte_p = ot.u16_to_byte(buf_content, op.p)
         local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
         vim.api.nvim_buf_set_text(bufnr, row, col, row, col, vim.split(op.i, '\n', { plain = true }))
       end
