@@ -63,6 +63,11 @@ confirmed by experiment:
 
 ## Phase 1: never drop or overwrite an external save (small, no decisions needed)
 
+**Done 2026-10-12.** Implemented as specified, plus two details: an empty disk file is rewritten
+rather than treated as an external edit, and a file deleted on disk is watched again once the
+plugin recreates it. Verified live in the sandbox: five rename-replace saves to a closed
+document all reached Overleaf, against only the first one on the previous code.
+
 **1a. Re-arm the document watcher on every event.** In `M.watch`, inside the
 scheduled callback, re-create the watch before handling the change, exactly as
 `watch_file` does:

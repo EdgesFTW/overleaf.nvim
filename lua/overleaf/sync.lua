@@ -21,6 +21,7 @@ M._write_timers = {} -- doc_id -> timer
 -- escape the window and be re-sent as an external change, and any genuine
 -- external edit that landed inside the window was dropped outright.
 M._last_written = {}
+M._deleted = {} -- path -> true: deleted on disk, watcher gone until we rewrite it
 
 -- Text fileRefs mirrored on disk. Overleaf stores anything whose extension is
 -- off its text whitelist (.asm, .c, ...) as an opaque "file" with no OT
@@ -76,6 +77,7 @@ function M.stop()
   M._last_uploaded = {}
   M._uploading = {}
   M._held = {}
+  M._deleted = {}
 
   M._sync_dir = nil
 end
@@ -120,6 +122,22 @@ function M.write_doc(doc)
 
   local path = M._sync_dir .. '/' .. doc.path
 
+  -- A watcher may have missed an external save while this write was debounced.
+  -- In viewing mode _on_file_changed holds it; do not overwrite that disk edit.
+  if M._last_written[path] ~= nil then
+    local existing = io.open(path, 'rb')
+    if existing then
+      local on_disk = existing:read('*a')
+      existing:close()
+      -- An empty file is a write caught half-done, which _on_file_changed
+      -- ignores; fall through and rewrite it rather than leave it empty.
+      if on_disk ~= '' and on_disk ~= M._last_written[path] and on_disk ~= doc.content then
+        M._on_file_changed(path, doc)
+        return
+      end
+    end
+  end
+
   -- Ensure parent directory exists
   local dir = vim.fn.fnamemodify(path, ':h')
   vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
@@ -144,9 +162,12 @@ function M.write_doc(doc)
 
   if renamed then
     M._last_written[path] = doc.content
-    -- rename() replaces the inode, leaving the fs_event watch bound to the old
-    -- one, where it stops firing and inbound external edits are silently lost.
-    if M._watchers[path] then M.watch(doc) end
+    -- Our rename() replaces the inode, so re-watch here. External renames are
+    -- handled in watch, which re-arms before processing their event.
+    if M._watchers[path] or M._deleted[path] then
+      M._deleted[path] = nil
+      M.watch(doc)
+    end
   end
 end
 
@@ -165,7 +186,7 @@ end
 
 --- Start watching a file for external changes
 ---@param doc table Document instance
-function M.watch(doc)
+function M.watch(doc, retrying)
   if not M._sync_dir then return end
 
   local path = M._sync_dir .. '/' .. doc.path
@@ -184,10 +205,36 @@ function M.watch(doc)
 
   M._watchers[path] = { handle = handle, doc_id = doc.doc_id }
 
-  handle:start(path, {}, function(err, _, _)
+  local ok = handle:start(path, {}, function(err, _, _)
     if err then return end
-    vim.schedule(function() M._on_file_changed(path, doc) end)
+    vim.schedule(function()
+      -- A rename-replace leaves the old inode's watcher silent. Re-arm before
+      -- processing this event so another external save cannot be missed.
+      if M._watchers[path] and M._watchers[path].handle == handle then
+        M.watch(doc)
+        M._on_file_changed(path, doc)
+      end
+    end)
   end)
+  if not ok then
+    handle:close()
+    local pending = { doc_id = doc.doc_id }
+    M._watchers[path] = pending
+    if retrying then
+      M._watchers[path] = nil
+      if not vim.uv.fs_stat(path) then
+        -- Remembered so the next write of this document recreates the file
+        -- and watches it again.
+        M._deleted[path] = true
+        config.log('warn', '%s was deleted on disk; it is not deleted on Overleaf', doc.path)
+      end
+    else
+      -- A rename may leave the path briefly absent; retry once after it settles.
+      vim.defer_fn(function()
+        if M._watchers[path] == pending then M.watch(doc, true) end
+      end, 200)
+    end
+  end
 end
 
 --- Stop watching a specific document's file
