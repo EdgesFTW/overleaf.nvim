@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft
+Implemented (merged in f3d4d28, "merge: Linux browser cookie extraction"). Kept for the design record.
 
 ## Problem
 
