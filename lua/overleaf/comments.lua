@@ -230,7 +230,7 @@ function M.get_thread_at_cursor(doc_id, _content)
   local offset = pos_to_offset(bufnr, cursor[1] - 1, cursor[2])
 
   for _, c in ipairs(comments) do
-    if offset >= c.offset and offset <= c.offset + c.length then
+    if offset >= c.offset and offset < c.offset + c.length then
       local thread = M._threads[c.threadId]
       if thread then return thread, c end
     end

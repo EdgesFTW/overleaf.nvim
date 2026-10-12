@@ -57,8 +57,13 @@ function M.on_client_updated(data)
     M._collaborators[user_id] = collab
   end
 
-  -- Update position
+  -- Update position. A collaborator who switched documents leaves their old
+  -- buffer, so their mark there has to go.
   if data.name then collab.name = data.name end
+  if collab.doc_id and collab.doc_id ~= data.doc_id then
+    local old_buf = find_bufnr(collab.doc_id)
+    if old_buf then pcall(vim.api.nvim_buf_del_extmark, old_buf, M._ns, M._get_mark_id(user_id)) end
+  end
   collab.doc_id = data.doc_id
   collab.row = data.row or 0
   collab.col = data.column or 0
@@ -111,7 +116,9 @@ function M._render_cursor(user_id, collab)
   pcall(vim.api.nvim_buf_del_extmark, bufnr, M._ns, mark_id)
 
   -- Place extmark at exact row:col with a highlighted cursor character
-  local end_col = math.min(col + 1, #line_text)
+  -- Highlight the whole character under the cursor, not its first byte.
+  local char = line_text:sub(col + 1):match('^[%z\1-\127\194-\244][\128-\191]*') or ''
+  local end_col = col + #char
   pcall(vim.api.nvim_buf_set_extmark, bufnr, M._ns, row, col, {
     id = mark_id,
     end_col = end_col,

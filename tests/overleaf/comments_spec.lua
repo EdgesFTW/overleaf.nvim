@@ -137,6 +137,14 @@ describe('comments', function()
       assert.are.equal('t1', thread.id)
     end)
 
+    it('ends at its last character, not the one after it', function()
+      bufnr = open(TEXT, ranges_for(TEXT, 'quick brown fox', 't1'))
+      vim.api.nvim_win_set_cursor(0, { 2, 18 }) -- the "x" of "fox"
+      assert.is_not_nil(comments.get_thread_at_cursor(DOC, text_of(bufnr)))
+      vim.api.nvim_win_set_cursor(0, { 2, 19 }) -- the space after it
+      assert.is_nil(comments.get_thread_at_cursor(DOC, text_of(bufnr)))
+    end)
+
     it('is not found where the comment used to be', function()
       bufnr = open(TEXT, ranges_for(TEXT, 'quick brown fox', 't1'))
       vim.api.nvim_buf_set_text(bufnr, 0, 0, 0, 0, { 'INSERTED SEVERAL WORDS BEFORE THE COMMENT ' })
