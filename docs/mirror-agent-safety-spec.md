@@ -103,7 +103,20 @@ the throwaway document.
 
 ## Phase 2: merge from the writer's starting version, and keep closed documents fresh
 
-**Done 2026-10-12 (unit-tested; live checks pending).** Implemented with the D1/D2 corrections below.
+**Done 2026-10-12, with live checks in the sandbox (two clients):**
+- every doc is joined, and no leaveDoc is sent;
+- a doc created on Overleaf is mirrored and followed;
+- a collaborator's edit reaches the closed mirror in under a second;
+- disjoint edits by an agent and a collaborator both survive;
+- an overlap detected before the mirror catches up yields `.overleaf-conflict.1`, and nothing is
+  sent;
+- after a socket drop, closed mirrors keep following;
+- typing right before `:bd` reaches the server, and reopening sends no joinDoc;
+- the two-client stress battery passes.
+
+Two adversarial reviews (lifecycle gaps, `:bunload`/`:e!`, file-restore) were fixed before merge.
+A closest-base heuristic for stale writers was tried and reverted: it undid deletions by
+fresh-read writers. The stale-writer limitation below stands. Implemented with the D1/D2 corrections below.
 - `sync_all` joins every document through `Document:join` and stays joined. `open_document` attaches
   a buffer to that Document (a join still in flight is shared, not repeated); closing the buffer keeps
   the document joined. `_rejoin_documents` rejoins documents without a buffer too.
