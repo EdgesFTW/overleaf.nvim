@@ -70,14 +70,11 @@ describe('document disk watcher', function()
   end)
 
   it('keeps a second external write that arrives before the debounced write', function()
-    doc.joined = true
+    doc = require('overleaf.document').new('doc_main', 'main.tex')
+    doc.joined, doc.version, doc.content, doc.server_content = true, 0, 'original', 'original'
+    doc._schedule_flush = function() end
     doc.bufnr = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, { doc.content })
-    buffer.replace_content = function(bufnr, content)
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { content })
-      doc.content = content
-      sync.schedule_write(doc)
-    end
     sync.write_doc(doc)
     sync.watch(doc)
 

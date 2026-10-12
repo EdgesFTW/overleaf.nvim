@@ -103,6 +103,19 @@ the throwaway document.
 
 ## Phase 2: merge from the writer's starting version, and keep closed documents fresh
 
+**Done 2026-10-12 (unit-tested; live checks pending).** Implemented with the D1/D2 corrections below.
+- `sync_all` joins every document through `Document:join` and stays joined. `open_document` attaches
+  a buffer to that Document (a join still in flight is shared, not repeated); closing the buffer keeps
+  the document joined. `_rejoin_documents` rejoins documents without a buffer too.
+- A disk edit, open or closed, is merged with `merge.three_way(_last_written[path], disk,
+  doc.content)` (after a synchronous `reconcile` when there is a buffer), sent with `submit_op`, shown
+  in the buffer like a remote edit, and written back to the file. Overlap: nothing is sent, the disk
+  version goes to `<file>.overleaf-conflict.<n>`, and the file is put back to `doc.content`. No base:
+  two-way with a warning.
+- A document whose join fails is mirrored as a snapshot with a warning; its disk edits use the old
+  join-and-leave path, now also merged three-way against the server text.
+- No evidence was found of a cap on joined documents per connection; that is still to be checked live.
+
 **2a. Three-way merge using the existing OT transform.** For every external change
 there are three versions:
 

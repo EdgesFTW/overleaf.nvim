@@ -80,10 +80,41 @@ function M.grep(pattern, state)
     processed = processed + 1
 
     -- Check if document is already open (has content in memory)
-    local open_doc = state and state.documents[doc_entry.id]
-    if open_doc and open_doc.content then
-      search_content(doc_entry.path, open_doc.content)
+    local doc = state and state.documents and state.documents[doc_entry.id]
+    if doc and doc.content then
+      search_content(doc_entry.path, doc.content)
       process_next(idx + 1)
+      return
+    end
+
+    -- A document the plugin tracks, or any document while the mirror keeps
+    -- them all joined, is joined through its Document and stays joined: a
+    -- leaveDoc would stop the updates it depends on. `join` shares a join
+    -- already in flight.
+    local sync = require('overleaf.sync')
+    if doc or (state and state.documents and sync.active()) then
+      local created = doc == nil
+      if created then
+        doc = require('overleaf.document').new(doc_entry.id, doc_entry.path)
+        state.documents[doc_entry.id] = doc
+      end
+      doc:join(function(err)
+        if state.documents[doc_entry.id] ~= doc then
+          -- Deleted (or the project closed) while the join was under way.
+          if not err then doc:leave() end
+          process_next(idx + 1)
+          return
+        end
+        if err and created then state.documents[doc_entry.id] = nil end
+        if not err and doc.content then
+          search_content(doc_entry.path, doc.content)
+          if sync.active() then
+            sync.write_doc(doc)
+            sync.watch(doc)
+          end
+        end
+        process_next(idx + 1)
+      end)
       return
     end
 

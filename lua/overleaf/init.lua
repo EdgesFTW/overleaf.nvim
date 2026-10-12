@@ -430,6 +430,34 @@ function M._remove_entity(entity_id)
   project.remove_entry(entity_id)
 end
 
+--- With a sync_dir, a document created on Overleaf is joined and mirrored
+--- like every other: its file follows the server and disk edits are merged.
+--- A document this client is creating from a disk file (Phase 3 import) is
+--- joined by that import, so it is left alone here.
+---@param doc_id string
+---@param path string
+function M._follow_new_doc(doc_id, path)
+  if not sync.active() or not M._state.connected then return end
+  if M._state.documents[doc_id] or sync._creating[path] then return end
+  local doc = Document.new(doc_id, path)
+  M._state.documents[doc_id] = doc
+  doc:join(function(err)
+    if M._state.documents[doc_id] ~= doc then
+      -- Deleted (or the project closed) while the join was under way.
+      if not err then doc:leave() end
+      return
+    end
+    if err then
+      if not doc.bufnr then M._state.documents[doc_id] = nil end
+      config.log('warn', 'Could not join new document %s; it is mirrored on the next :Overleaf sync', path)
+      return
+    end
+    sync.preserve_disk_only(doc)
+    sync.write_doc(doc)
+    sync.watch(doc)
+  end)
+end
+
 function M._setup_event_handlers()
   M._registered_handlers = M._registered_handlers or {}
   local function on_event(name, handler)
@@ -515,41 +543,34 @@ function M._setup_event_handlers()
             old_doc._flush_timer = nil
           end
 
-          -- Immediately join the new doc (server already has it ready)
-          bridge.request('joinDoc', { docId = new_id }, function(err, result)
+          -- Immediately join the new doc (server already has it ready),
+          -- through the Document so that events queued meanwhile are replayed.
+          old_doc._rejoining = false
+          old_doc:join(function(err, _, ranges)
             if err then
               config.log('error', 'Failed to join restored doc %s: %s', meta.path or '?', err.message)
               return
             end
+            config.log('info', 'Restored doc %s (v%d)', meta.path or '?', old_doc.version)
+            sync.schedule_write(old_doc)
 
-            local content = table.concat(result.lines, '\n')
-            old_doc.version = result.version
-            old_doc.content = content
-            old_doc.server_content = content
-            old_doc.joined = true
-            old_doc._rejoining = false
-            old_doc.ranges = result.ranges
-
-            config.log('info', 'Restored doc %s (v%d)', meta.path or '?', result.version)
-
-            -- Update buffer with new content
+            -- Show the restored text now, before anything waiting for this
+            -- join (a disk edit made meanwhile) changes the document further: a
+            -- later replace would undo that change in the buffer only.
             if old_doc.bufnr and vim.api.nvim_buf_is_valid(old_doc.bufnr) then
-              vim.schedule(function()
-                old_doc.applying_remote = true
-                buffer.unlocked(
-                  old_doc.bufnr,
-                  function() vim.api.nvim_buf_set_lines(old_doc.bufnr, 0, -1, false, result.lines) end
-                )
-                vim.bo[old_doc.bufnr].modified = false
-                old_doc.applying_remote = false
+              local ok, replace_err = pcall(old_doc._replace_buffer, old_doc, old_doc.content)
+              if not ok then config.log('warn', 'Could not show restored %s: %s', meta.path or '?', replace_err) end
+              vim.bo[old_doc.bufnr].modified = false
 
-                -- Re-render comments if available
-                if result.ranges then
+              -- Re-render comments if available
+              if ranges then
+                vim.schedule(function()
+                  if not (old_doc.bufnr and vim.api.nvim_buf_is_valid(old_doc.bufnr)) then return end
                   local comments = require('overleaf.comments')
-                  comments.parse_ranges(new_id, result.ranges)
+                  comments.parse_ranges(new_id, ranges)
                   comments.render(old_doc.bufnr, new_id, old_doc.content)
-                end
-              end)
+                end)
+              end
             end
           end)
         end
@@ -582,6 +603,8 @@ function M._setup_event_handlers()
         depth = depth,
       })
     end
+    local entry = project.get_doc_by_id(new_id)
+    if entry and entry.type == 'doc' then M._follow_new_doc(new_id, entry.path) end
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
 
@@ -841,8 +864,10 @@ function M._reconnect_to_project(cookie)
 end
 
 function M._rejoin_documents()
+  -- Joined documents without a buffer too: with a sync_dir every mirrored
+  -- document stays joined, and its file must keep following the server.
   for _, doc in pairs(M._state.documents) do
-    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then doc:rejoin() end
+    if doc.joined or (doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr)) then doc:rejoin() end
   end
 end
 
@@ -865,26 +890,29 @@ function M.open_document(doc_id_or_path, doc_path)
     end
   end
 
-  -- Check if already open
-  if M._state.documents[doc_id] then
-    local existing = M._state.documents[doc_id]
-    if existing.bufnr and vim.api.nvim_buf_is_valid(existing.bufnr) then
-      vim.api.nvim_set_current_buf(existing.bufnr)
-      return
-    end
+  local doc = M._state.documents[doc_id]
+  if doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+    vim.api.nvim_set_current_buf(doc.bufnr)
+    return
   end
 
-  local doc = Document.new(doc_id, path)
-  M._state.documents[doc_id] = doc
+  -- With a sync_dir the document is usually joined already, without a buffer.
+  -- The buffer attaches to that Document: a second Document, or a second
+  -- joinDoc, would split the document's version and in-flight state in two.
+  local created = doc == nil
+  if created then
+    doc = Document.new(doc_id, path)
+    M._state.documents[doc_id] = doc
+  end
 
-  doc:join(function(err, lines, ranges)
-    if err then
-      M._state.documents[doc_id] = nil
+  local function attach(ranges)
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+      vim.api.nvim_set_current_buf(doc.bufnr)
       return
     end
-
-    buffer.create(doc, lines)
-    if not mode.writable() then vim.bo[doc.bufnr].modifiable = false end
+    local bufnr = buffer.create(doc, vim.split(doc.content, '\n', { plain = true }))
+    if not mode.writable() then vim.bo[bufnr].modifiable = false end
+    M._detach_on_close(doc, bufnr)
 
     -- Write to sync dir and start watching for external changes
     sync.write_doc(doc)
@@ -898,7 +926,85 @@ function M.open_document(doc_id_or_path, doc_path)
         if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then comments.render(doc.bufnr, doc_id, doc.content) end
       end)
     end
+  end
+
+  if doc.content ~= nil and (doc.joined or doc._rejoining) then
+    attach(doc.ranges)
+    return
+  end
+
+  doc:join(function(err, _, ranges)
+    if err then
+      if created and M._state.documents[doc_id] == doc then M._state.documents[doc_id] = nil end
+      return
+    end
+    attach(ranges)
   end)
+end
+
+--- Closing a document's buffer keeps the document joined: with a sync_dir its
+--- file keeps following the server and disk edits are still merged, and
+--- opening it again needs no new join. The buffer's last typing is sent first.
+--- `:bdelete` and `:bunload` leave an unloaded buffer under the document's
+--- name; it is wiped so that opening the document again can create a fresh
+--- one. `:edit` reloads the buffer from the mirror file instead; it is then
+--- attached again and shown the document's text.
+---@param doc table Document instance
+---@param bufnr number
+function M._detach_on_close(doc, bufnr)
+  -- Neovim detaches the change listener before any of these events, which
+  -- drops the record of unsent lines; compare the whole buffer instead. The
+  -- text is still there until the events return.
+  local function send_last_typing()
+    if doc.content ~= nil and vim.api.nvim_buf_is_loaded(bufnr) then
+      doc._dirty = { first = 0, from_end = 0 }
+      pcall(buffer.reconcile, doc)
+    end
+  end
+  local function detach()
+    doc.bufnr = nil
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(bufnr) then pcall(vim.api.nvim_buf_delete, bufnr, { force = true }) end
+    end)
+  end
+
+  vim.api.nvim_create_autocmd('BufUnload', {
+    buffer = bufnr,
+    callback = function()
+      if doc.bufnr ~= bufnr then return true end
+      send_last_typing()
+      -- `:edit` reloads within the same command; anything else leaves the
+      -- buffer unloaded.
+      vim.schedule(function()
+        if doc.bufnr ~= bufnr then return end
+        if not (vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)) then
+          detach()
+          return
+        end
+        -- Reloaded from the mirror file, which may lag the document or hold
+        -- a disk edit not processed yet. Show the document's text; the watcher
+        -- (or the mirror write's check) merges any disk edit as usual.
+        buffer.attach(bufnr, doc)
+        local ok, err = pcall(doc._replace_buffer, doc, doc.content)
+        if not ok then config.log('warn', 'Could not restore %s after a reload: %s', doc.path, err) end
+        vim.bo[bufnr].modified = false
+        if not mode.writable() then vim.bo[bufnr].modifiable = false end
+        -- Disk changes reach the buffer only through the merge. (Neovim does
+        -- not check an acwrite buffer's file on :checktime anyway.)
+        vim.bo[bufnr].autoread = false
+        sync.schedule_write(doc)
+      end)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout' }, {
+    buffer = bufnr,
+    callback = function()
+      if doc.bufnr ~= bufnr then return true end
+      send_last_typing()
+      detach()
+      return true
+    end,
+  })
 end
 
 --- Open a fileRef (a file Overleaf stores as binary) for editing.

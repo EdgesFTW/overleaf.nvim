@@ -90,12 +90,25 @@ function Document.new(doc_id, path)
 end
 
 function Document:join(callback)
+  -- A second caller (opening a document the mirror is still joining) waits for
+  -- the same joinDoc instead of sending another.
+  if self._joining then
+    self._join_waiters = self._join_waiters or {}
+    self._join_waiters[#self._join_waiters + 1] = callback
+    return
+  end
+  self._left = false
   self._joining = true
   bridge.request('joinDoc', { docId = self.doc_id }, function(err, result)
+    local waiters = self._join_waiters or {}
+    self._join_waiters = nil
     if err then
       self._joining = false
       config.log('error', 'Failed to join doc %s: %s', self.path, err.message)
       if callback then callback(err) end
+      for _, waiter in ipairs(waiters) do
+        if waiter then waiter(err) end
+      end
       return
     end
     local content = table.concat(result.lines, '\n')
@@ -107,18 +120,34 @@ function Document:join(callback)
     self._joining = false
     config.log('debug', 'Joined doc: %s (v%d)', self.path, self.version)
     if callback then callback(nil, result.lines, result.ranges) end
+    for _, waiter in ipairs(waiters) do
+      if waiter then waiter(nil, result.lines, result.ranges) end
+    end
     self:_replay_queued()
   end)
 end
 
 function Document:leave(callback)
-  if not self.joined then
+  -- A rejoin already scheduled must not join the document again (after a
+  -- project switch it would do so on the next project's socket).
+  self._left = true
+  stop_timer(self, '_flush_timer')
+  stop_timer(self, '_ack_timer')
+  if self._joining then
+    -- Leave once the join answers, without holding the caller up.
+    self:join(function(err)
+      if not err and self._left then self:leave() end
+    end)
     if callback then callback(nil) end
     return
   end
-  stop_timer(self, '_flush_timer')
-  stop_timer(self, '_ack_timer')
+  if not self.joined or self._leaving then
+    if callback then callback(nil) end
+    return
+  end
+  self._leaving = true
   bridge.request('leaveDoc', { docId = self.doc_id }, function(err)
+    self._leaving = false
     self.joined = false
     clear_inflight(self)
     self.pending_ops = nil
@@ -394,6 +423,10 @@ function Document:_fallback(attempt)
   self._force_merge = true
   bridge.request('joinDoc', { docId = self.doc_id, fromVersion = -1 }, function(err, result)
     self:_guard(attempt, function()
+      if self._left then
+        self._rejoining = false
+        return
+      end
       if err or not result or not result.lines then return self:_retry_rejoin(attempt, err) end
       local theirs = table.concat(result.lines, '\n')
       local base = self.server_content
@@ -525,6 +558,10 @@ function Document:rejoin(reason, attempt)
   local delay = BACKOFF[attempt] or BACKOFF[#BACKOFF]
   vim.defer_fn(function()
     self:_guard(attempt, function()
+      if self._left then
+        self._rejoining = false
+        return
+      end
       if not state().connected then
         -- The reconnect rejoins again.
         self._rejoining = false
@@ -533,6 +570,10 @@ function Document:rejoin(reason, attempt)
       if self._force_merge or self.version == nil then return self:_fallback(attempt) end
       bridge.request('joinDoc', { docId = self.doc_id, fromVersion = self.version }, function(err, result)
         self:_guard(attempt, function()
+          if self._left then
+            self._rejoining = false
+            return
+          end
           if err or not result or not result.lines or not result.updates then
             return self:_catch_up_failed(attempt, err or 'no catch-up updates')
           end

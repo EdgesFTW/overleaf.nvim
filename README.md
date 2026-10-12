@@ -333,12 +333,28 @@ Disk deletions and renames are never sent to Overleaf automatically.
 
 ### How it works
 
-- **On connect**: all documents are fetched and written to disk
+- **On connect**: every document is joined and written to disk, and stays
+  joined while `sync_dir` is set, whether or not it is open in Neovim. Closing a
+  buffer keeps its document joined; opening it again needs no new join.
 - **Neovim edits**: debounced writes keep disk files up to date
-- **Remote edits**: open documents and their disk files update live; closed documents' disk files refresh on connect, sync, or open
-- **External edits**: file watchers detect changes and sync them to Overleaf via OT
-  - For open documents: buffer is updated, triggering the normal OT pipeline
-  - For closed documents: changes are sent directly via the bridge
+- **Remote edits**: every document's disk file follows collaborators' edits
+  live, open or not, so an external tool always reads current text
+- **External edits**: file watchers detect each save, including the
+  temp-file-and-rename saves Claude Code makes, and merge it with what changed
+  since the plugin last wrote the file:
+  - the writer's edits and the edits made meanwhile (by collaborators, or
+    typed in Neovim) are combined, sent to Overleaf as ordinary edits, shown in
+    the buffer if the document is open, and written back to the file;
+  - if the two sides touch the same words, nothing is sent: the writer's
+    version is saved next to the file as `<file>.overleaf-conflict.<n>`, the
+    file is put back to the Overleaf text, and a warning names both;
+  - the merge assumes the writer read the file just before writing it, as
+    Claude Code does. A tool that writes back a copy it read long ago undoes
+    whatever changed since, as any editor would.
+- If Overleaf refuses to join a document, a warning says so and that file is
+  only a snapshot: it does not follow remote edits until the next
+  `:Overleaf sync`, and a disk edit to it is merged against a fresh copy from
+  the server.
 
 ### Commands
 

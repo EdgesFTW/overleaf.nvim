@@ -5,6 +5,7 @@ local bridge = require('overleaf.bridge')
 local diff = require('overleaf.diff')
 local ot = require('overleaf.ot')
 local mode = require('overleaf.mode')
+local merge = require('overleaf.merge')
 
 local M = {}
 
@@ -54,6 +55,34 @@ for ext in
   ):gmatch('%S+')
 do
   TEXT_EXTENSIONS[ext] = true
+end
+
+local function read_bytes(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local data = f:read('*a')
+  f:close()
+  return data
+end
+
+-- Atomic private write, as write_doc does for docs. Returns true on success.
+local function write_bytes(path, data)
+  local dir = vim.fn.fnamemodify(path, ':h')
+  vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
+  if M._new_file_state then M.watch_directory(dir) end
+  local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
+  local f = io.open(tmp_path, 'wb')
+  if not f then return false end
+  f:write(data)
+  f:close()
+  pcall(vim.uv.fs_chmod, tmp_path, tonumber('600', 8))
+  local ok, err = os.rename(tmp_path, path)
+  if not ok then
+    config.log('warn', 'Atomic write failed for %s: %s', path, tostring(err))
+    os.remove(tmp_path)
+    return false
+  end
+  return true
 end
 
 --- Start sync for a project. Creates the sync directory.
@@ -161,21 +190,47 @@ function M.write_doc(doc)
 
   local path = M._sync_dir .. '/' .. doc.path
 
+  local existing = io.open(path, 'rb')
+  local on_disk = existing and existing:read('*a')
+  if existing then existing:close() end
+
   -- A watcher may have missed an external save while this write was debounced.
   -- In viewing mode _on_file_changed holds it; do not overwrite that disk edit.
-  if M._last_written[path] ~= nil then
-    local existing = io.open(path, 'rb')
-    if existing then
-      local on_disk = existing:read('*a')
-      existing:close()
-      -- An empty file is a write caught half-done, which _on_file_changed
-      -- ignores; fall through and rewrite it rather than leave it empty.
-      if on_disk ~= '' and on_disk ~= M._last_written[path] and on_disk ~= doc.content then
-        M._on_file_changed(path, doc)
-        return
-      end
-    end
+  -- An empty file is a write caught half-done, which _on_file_changed ignores;
+  -- fall through and rewrite it rather than leave it empty.
+  if
+    M._last_written[path] ~= nil
+    and on_disk ~= nil
+    and on_disk ~= ''
+    and on_disk ~= M._last_written[path]
+    and on_disk ~= doc.content
+  then
+    M._on_file_changed(path, doc)
+    return
   end
+
+  -- Already there: leave the file alone, so a tool that checks the file's
+  -- modification time before editing does not see a change that is not one.
+  if on_disk == doc.content then
+    M._last_written[path] = on_disk
+    if M._deleted[path] then
+      M._deleted[path] = nil
+      M.watch(doc)
+    end
+    return
+  end
+
+  M._write_text(doc, doc.content)
+end
+
+--- Write `content` to a document's mirror file, without the check write_doc
+--- makes for an unprocessed external edit. Returns true on success.
+---@param doc table Document instance
+---@param content string
+---@return boolean
+function M._write_text(doc, content)
+  if not M._sync_dir then return false end
+  local path = M._sync_dir .. '/' .. doc.path
 
   -- Ensure parent directory exists
   local dir = vim.fn.fnamemodify(path, ':h')
@@ -187,7 +242,7 @@ function M.write_doc(doc)
   local f = io.open(tmp_path, 'w')
   local renamed = false
   if f then
-    f:write(doc.content)
+    f:write(content)
     f:close()
     -- Match the directory: the mirrored document is private to the user.
     pcall(vim.uv.fs_chmod, tmp_path, tonumber('600', 8))
@@ -201,7 +256,7 @@ function M.write_doc(doc)
   end
 
   if renamed then
-    M._last_written[path] = doc.content
+    M._last_written[path] = content
     -- Our rename() replaces the inode, so re-watch here. External renames are
     -- handled in watch, which re-arms before processing their event.
     if M._watchers[path] or M._deleted[path] then
@@ -209,6 +264,7 @@ function M.write_doc(doc)
       M.watch(doc)
     end
   end
+  return renamed
 end
 
 --- Schedule a debounced write to disk (call after content changes)
@@ -349,51 +405,208 @@ function M.held_count()
   return n
 end
 
+--- Whether a document keeps its own live text: joined, or rejoining. Disk
+--- edits to one are merged into that text and sent through the Document.
+local function is_live(doc) return doc.content ~= nil and (doc.joined == true or doc._rejoining == true) end
+
+local function has_buffer(doc) return doc.bufnr ~= nil and vim.api.nvim_buf_is_valid(doc.bufnr) end
+
+--- Keep a disk edit to a document that is not syncing with Overleaf (stopped
+--- after a failure, or open but not joined). It is merged once the document
+--- rejoins: the rejoin's mirror write finds it (see write_doc).
+local function hold_unsynced(path, doc)
+  if not M._held[path] then
+    config.log(
+      'warn',
+      'Not sending the disk edit to %s: the document is not syncing with Overleaf. '
+        .. 'The edit stays on disk and is merged when the document rejoins',
+      doc.path
+    )
+  end
+  M._held[path] = true
+end
+
+--- A name next to `path` that no file has yet.
+local function conflict_path(path)
+  local n = 1
+  while vim.uv.fs_lstat(path .. '.overleaf-conflict.' .. n) do
+    n = n + 1
+  end
+  return path .. '.overleaf-conflict.' .. n
+end
+
+--- A document that appears on Overleaf where a file already exists only on
+--- disk (an agent's file not yet imported, or one made while sync_new_files
+--- is off) would be overwritten by the mirror. Keep those bytes first.
+---@param doc table Document instance with content
+function M.preserve_disk_only(doc)
+  if not M._sync_dir or doc.content == nil then return end
+  local path = M.file_path(doc.path)
+  if M._last_written[path] ~= nil then return end
+  local on_disk = read_bytes(path)
+  if not on_disk or on_disk == doc.content then return end
+  local copy = conflict_path(path)
+  if write_bytes(copy, on_disk) then
+    config.log(
+      'warn',
+      '%s was created on Overleaf over a file only on disk; the disk file was kept as %s',
+      doc.path,
+      copy
+    )
+  else
+    config.log('error', '%s was created on Overleaf over a file only on disk, which could not be saved', doc.path)
+  end
+end
+
+--- Merge an external write into the current text. `base` is what the writer
+--- read: the bytes the plugin last wrote. Returns the text Overleaf should
+--- hold, or nil when the two sides' edits overlap. Then nothing may be sent:
+--- the writer's version goes to a conflict copy and the file is put back to
+--- `theirs`.
+---@param path string disk path
+---@param doc table Document instance
+---@param base string|nil
+---@param mine string the disk content
+---@param theirs string the current text
+---@return string|nil
+function M._merge_external(path, doc, base, mine, theirs)
+  if base == nil then
+    config.log('warn', '%s changed on disk before the plugin wrote it; sent as it is, without a merge', doc.path)
+    return mine
+  end
+  local merged = merge.three_way(base, mine, theirs)
+  if merged then return merged end
+  local copy = conflict_path(path)
+  if not write_bytes(copy, mine) then
+    -- The disk holds the writer's only copy. Keep the base, so a later
+    -- write_doc does not take it for our own echo and write over it.
+    M._last_written[path] = base
+    M._held[path] = true
+    config.log(
+      'error',
+      'The disk edit to %s overlaps edits made on Overleaf, and could not be saved to %s. '
+        .. 'Nothing was sent and the file was left as it is',
+      doc.path,
+      copy
+    )
+    return nil
+  end
+  M._write_text(doc, theirs)
+  config.log(
+    'warn',
+    'The disk edit to %s overlaps edits made on Overleaf since it was read. Nothing was sent: '
+      .. '%s now holds the Overleaf text and the disk edit is in %s',
+    doc.path,
+    doc.path,
+    copy
+  )
+  return nil
+end
+
+--- Send `merged` from a live document's current text `theirs`, showing it in
+--- the buffer if the document is open. Returns the text Overleaf will hold,
+--- which differs from `merged` where it had characters Overleaf cannot store.
+---@param doc table Document instance
+---@param theirs string
+---@param merged string
+---@return string
+local function apply_merged(doc, theirs, merged)
+  local ops, replaced = ot.sanitize_inserts(diff.ops(theirs, merged, 0, { words = mode.tracked() }))
+  if #ops == 0 then return theirs end
+  local content = ot.apply(theirs, ops)
+  doc.content = content
+  if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+    -- Shown the way a remote edit is: the change is already in doc.content,
+    -- so the buffer must not diff it a second time.
+    local ok, err = pcall(doc._replace_buffer, doc, content)
+    if not ok then config.log('warn', 'Could not show the disk edit to %s in its buffer: %s', doc.path, err) end
+  end
+  doc:submit_op(ops)
+  config.log('info', 'Synced external change: %s', doc.path)
+  if replaced then
+    config.log('warn', 'Characters outside the Basic Multilingual Plane in %s were stored as U+FFFD', doc.path)
+  end
+  return content
+end
+
+--- Merge a disk edit into a live document and write the result back.
+local function sync_live_doc(path, doc, mine)
+  local theirs = doc.content
+  local merged = M._merge_external(path, doc, M._last_written[path], mine, theirs)
+  if not merged then return end
+  local content = apply_merged(doc, theirs, merged)
+  if content ~= mine then
+    -- The writer's file gets the edits it had not seen.
+    M._write_text(doc, content)
+  else
+    -- The disk holds the document's text. Record it as the in-sync state,
+    -- otherwise a later edit that restores the bytes we last wrote ourselves
+    -- (an undo, a revert) would look like our own echo and be dropped.
+    M._last_written[path] = mine
+  end
+  -- Catches a later external save whose watcher event is lost (see write_doc).
+  M.schedule_write(doc)
+end
+
 --- Handle external file change
 ---@param path string local file path
 ---@param doc table Document instance
 function M._on_file_changed(path, doc)
-  local f = io.open(path, 'r')
-  if not f then return end
-  local new_content = f:read('*a')
-  f:close()
-
-  -- No change
-  if new_content == doc.content then return end
+  local mine = read_bytes(path)
+  if not mine then return end
 
   -- Our own write coming back. Compared against what we actually wrote, not a
   -- timer, so it stays correct however long the write took and however much the
   -- document has moved on since.
-  if new_content == M._last_written[path] then return end
+  if mine == M._last_written[path] then return end
+
+  -- The buffer's latest typing becomes part of the text the edit is merged into.
+  if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then require('overleaf.buffer').reconcile(doc) end
+
+  -- No change
+  if mine == doc.content then
+    M._last_written[path] = mine
+    return
+  end
 
   -- Read-only: leave the file as the external tool wrote it and send nothing.
   if not mode.writable() then
     hold(path, doc.path)
     return
   end
-  M._held[path] = nil
 
   -- Guard: reject empty content when document has existing data.
   -- Prevents truncated file reads (race with external writes) from wiping the buffer.
-  if #new_content == 0 and doc.content and #doc.content > 0 then
+  if #mine == 0 and doc.content and #doc.content > 0 then
     config.log('debug', 'Ignoring empty file read for %s (doc has %d bytes)', doc.path, #doc.content)
     return
   end
 
   config.log('info', 'External change: %s', doc.path)
-  -- The disk now holds this content and the doc is about to match it. Record
-  -- it as the in-sync state, otherwise a later edit that restores the bytes we
-  -- last wrote ourselves (an undo, a revert) would look like our own echo and
-  -- be dropped.
-  M._last_written[path] = new_content
-
-  if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-    -- Doc is open in Neovim: change only what differs (triggers on_lines → OT →
-    -- server), so comment highlights on the untouched text stay where they are.
-    require('overleaf.buffer').replace_content(doc.bufnr, new_content)
+  if doc._joining then
+    -- A join is under way (a restore, or a first join): merge once it has the
+    -- text, reading the disk again then.
+    if not doc._external_waiting then
+      doc._external_waiting = true
+      local generation = M._generation
+      doc:join(function(err)
+        doc._external_waiting = nil
+        if M._generation ~= generation then return end
+        if err then
+          hold_unsynced(path, doc)
+          return
+        end
+        M._on_file_changed(path, doc)
+      end)
+    end
+  elseif doc._stopped or (has_buffer(doc) and not is_live(doc)) then
+    hold_unsynced(path, doc)
+  elseif is_live(doc) then
+    M._held[path] = nil
+    sync_live_doc(path, doc, mine)
   else
-    -- Doc is NOT open: join, send OT ops directly, leave
-    M._sync_closed_doc(doc, new_content)
+    M._held[path] = nil
+    M._sync_closed_doc(doc, mine)
   end
 end
 
@@ -415,68 +628,116 @@ function M._sync_joined_doc(doc, new_content)
   end
 end
 
---- Sync a changed file for a document that is not open in Neovim
+--- Sync a disk change for a document the mirror could not keep joined: join,
+--- merge against the server text, send, and leave. Live documents are merged
+--- into their own text instead.
 ---@param doc table Document instance
 ---@param new_content string new file content
 ---@param callback function|nil called with an error after the edit completes
 function M._sync_closed_doc(doc, new_content, callback)
   callback = callback or function() end
-  if doc.joined and doc.content ~= nil then
-    M._sync_joined_doc(doc, new_content)
+  local path = M._sync_dir .. '/' .. doc.path
+  if is_live(doc) then
+    sync_live_doc(path, doc, new_content)
     callback(nil)
     return
   end
-  local function joined(err, result)
+  -- The base is what the writer read. The disk now holds its edit; record that
+  -- as the in-sync state at once, so that a revert to these bytes while the
+  -- join is under way is not taken for our own echo. A failure puts the base
+  -- back (see `unsent`).
+  local base = M._last_written[path]
+  M._last_written[path] = new_content
+  local function snapshot(text, version)
+    doc.content = text
+    doc.server_content = text
+    doc.version = version
+  end
+  local function restore_base()
+    if M._last_written[path] == new_content then M._last_written[path] = base end
+  end
+  -- The edit did not reach Overleaf: keep it on disk and held, and keep the
+  -- base, so a later write_doc does not take the writer's only copy for our
+  -- own echo and write over it.
+  local function unsent(why, err)
+    restore_base()
+    M._held[path] = true
+    config.log('error', '%s for %s: %s; the disk edit was not sent and stays on disk', why, doc.path, err.message)
+  end
+  -- A Document joined this document meanwhile (it was opened, or the mirror
+  -- joined it again): it owns the text now, and a leaveDoc would stop its
+  -- updates.
+  local function taken_over() return doc.joined or doc._joining end
+  local generation = M._generation
+  bridge.request('joinDoc', { docId = doc.doc_id }, function(err, result)
+    local function leave(done_err)
+      if not taken_over() then bridge.request('leaveDoc', { docId = doc.doc_id }, function() end) end
+      callback(done_err)
+    end
     if err then
-      config.log('error', 'Sync join failed for %s: %s', doc.path, err.message)
+      if M._generation == generation then unsent('Sync join failed', err) end
       callback(err)
       return
     end
-
-    local server_content = table.concat(result.lines, '\n')
-    local version = result.version
-
-    -- No change from server's perspective
-    if new_content == server_content then
-      bridge.request('leaveDoc', { docId = doc.doc_id }, function() end)
+    if M._generation ~= generation then return leave() end
+    if taken_over() then
+      restore_base()
+      M._on_file_changed(path, doc)
       callback(nil)
+      return
+    end
+
+    local theirs = table.concat(result.lines, '\n')
+    local version = result.version
+    if new_content == theirs then
+      snapshot(theirs, version)
+      leave()
+      return
+    end
+    local merged = M._merge_external(path, doc, base, new_content, theirs)
+    if not merged then
+      snapshot(theirs, version)
+      leave()
       return
     end
 
     -- Only the words that differ. Deleting the whole document and typing it
     -- back would wipe every comment and suggestion in it, because Overleaf drops
     -- those anchored to any text an op deletes.
-    local ops, replaced = ot.sanitize_inserts(diff.ops(server_content, new_content, 0, { words = mode.tracked() }))
-    if replaced then new_content = ot.apply(server_content, ops) end
+    local ops, replaced = ot.sanitize_inserts(diff.ops(theirs, merged, 0, { words = mode.tracked() }))
+    if replaced then merged = ot.apply(theirs, ops) end
+    if #ops == 0 then
+      snapshot(theirs, version)
+      M._write_text(doc, theirs)
+      leave()
+      return
+    end
 
     bridge.request('applyOtUpdate', {
       docId = doc.doc_id,
       op = ops,
       v = version,
-      content = server_content,
-      tracked = require('overleaf.mode').tracked(),
+      content = theirs,
+      tracked = mode.tracked(),
     }, function(ot_err, _)
+      if M._generation ~= generation then return leave(ot_err) end
       if ot_err then
-        config.log('error', 'Sync OT failed for %s: %s', doc.path, ot_err.message)
+        unsent('Sync OT failed', ot_err)
+      elseif taken_over() then
+        -- The Document catches up with this op from the server.
+        config.log('info', 'Synced external change: %s', doc.path)
       else
         config.log('info', 'Synced external change: %s', doc.path)
-        -- Update doc state
-        doc.content = new_content
-        doc.server_content = new_content
-        doc.version = (version or 0) + 1
-        -- Emoji were stored as U+FFFD; put what Overleaf has back on disk.
+        snapshot(merged, (version or 0) + 1)
         if replaced then
           config.log('warn', 'Characters outside the Basic Multilingual Plane in %s were stored as U+FFFD', doc.path)
-          M.schedule_write(doc)
         end
+        -- The writer's file gets what Overleaf now has.
+        if merged ~= new_content then M._write_text(doc, merged) end
       end
-
-      -- Leave the doc
-      bridge.request('leaveDoc', { docId = doc.doc_id }, function() end)
-      callback(ot_err)
+      leave(ot_err)
     end)
-  end
-  bridge.request('joinDoc', { docId = doc.doc_id }, joined)
+  end)
 end
 
 -- ── FileRefs ─────────────────────────────────────────────────────────────
@@ -558,34 +819,6 @@ function M.file_policy(entry)
   end
   if BINARY_EXTENSIONS[ext] then return false end
   return nil
-end
-
-local function read_bytes(path)
-  local f = io.open(path, 'rb')
-  if not f then return nil end
-  local data = f:read('*a')
-  f:close()
-  return data
-end
-
--- Atomic private write, as write_doc does for docs. Returns true on success.
-local function write_bytes(path, data)
-  local dir = vim.fn.fnamemodify(path, ':h')
-  vim.fn.mkdir(dir, 'p', SYNC_DIR_MODE)
-  if M._new_file_state then M.watch_directory(dir) end
-  local tmp_path = path .. '.tmp.' .. vim.uv.getpid()
-  local f = io.open(tmp_path, 'wb')
-  if not f then return false end
-  f:write(data)
-  f:close()
-  pcall(vim.uv.fs_chmod, tmp_path, tonumber('600', 8))
-  local ok, err = os.rename(tmp_path, path)
-  if not ok then
-    config.log('warn', 'Atomic write failed for %s: %s', path, tostring(err))
-    os.remove(tmp_path)
-    return false
-  end
-  return true
 end
 
 local function new_files_enabled()
@@ -1258,50 +1491,73 @@ function M.sync_all(state, project_tree, callback)
     end
   end
 
-  for _, entry in ipairs(docs) do
-    local doc_id = entry.id
-    local doc_path = entry.path
+  local Document = require('overleaf.document')
+  local generation = M._generation
 
-    -- Check if already open
-    local existing = state.documents[doc_id]
-    if existing and existing.content then
+  -- Fallback for a document the Document could not join: mirror a snapshot
+  -- and leave, as before. Its file does not follow remote edits, and disk
+  -- edits to it are merged against a fresh join (_sync_closed_doc).
+  local function snapshot(doc)
+    bridge.request('joinDoc', { docId = doc.doc_id }, function(err, result)
+      if M._generation ~= generation then return end
+      if err then
+        config.log('warn', 'Could not mirror %s: %s', doc.path, err.message or tostring(err))
+        if state.documents[doc.doc_id] == doc and doc.content == nil then state.documents[doc.doc_id] = nil end
+        on_done()
+        return
+      end
+      -- A Document joined it meanwhile, which owns it now: no leave.
+      if doc.joined or doc._joining then return on_done() end
+      if state.documents[doc.doc_id] ~= doc then
+        -- Deleted while the join was under way.
+        bridge.request('leaveDoc', { docId = doc.doc_id }, function() end)
+        return on_done()
+      end
+      local content = table.concat(result.lines, '\n')
+      doc.content = content
+      doc.server_content = content
+      doc.version = result.version
+      M.write_doc(doc)
+      M.watch(doc)
+      bridge.request('leaveDoc', { docId = doc.doc_id }, function() on_done() end)
+    end)
+  end
+
+  for _, entry in ipairs(docs) do
+    local doc = state.documents[entry.id]
+    local open = doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr)
+    if doc and doc.content ~= nil and (doc.joined or doc._rejoining or open) then
       -- Already joined, just write
-      M.write_doc(existing)
-      M.watch(existing)
+      M.write_doc(doc)
+      M.watch(doc)
       on_done()
     else
-      -- Need to join, write, leave
-      bridge.request('joinDoc', { docId = doc_id }, function(err, result)
+      if not doc then
+        doc = Document.new(entry.id, entry.path)
+        state.documents[entry.id] = doc
+      end
+      -- Every mirrored document stays joined, so remote edits keep its file
+      -- current and a disk edit is merged into live text.
+      doc:join(function(err)
+        if M._generation ~= generation then return end
+        if state.documents[entry.id] ~= doc then
+          -- Deleted while the join was under way.
+          if not err then doc:leave() end
+          return on_done()
+        end
         if err then
-          config.log('debug', 'Sync skip %s: %s', doc_path, err.message)
-          on_done()
+          config.log(
+            'warn',
+            'Could not keep %s joined (%s); its mirror is a snapshot that does not follow remote edits',
+            doc.path,
+            err.message or tostring(err)
+          )
+          snapshot(doc)
           return
         end
-
-        local content = table.concat(result.lines, '\n')
-
-        -- Create a lightweight doc object for writing and watching
-        local doc = state.documents[doc_id]
-        if not doc then
-          local Document = require('overleaf.document')
-          doc = Document.new(doc_id, doc_path)
-          doc.content = content
-          doc.server_content = content
-          doc.version = result.version
-          -- Store it so watchers can find it
-          state.documents[doc_id] = doc
-        end
-
         M.write_doc(doc)
         M.watch(doc)
-
-        -- Leave if no buffer (not opened by user)
-        if not doc.bufnr then
-          doc.joined = false
-          bridge.request('leaveDoc', { docId = doc_id }, function() on_done() end)
-        else
-          on_done()
-        end
+        on_done()
       end)
     end
   end
@@ -1326,11 +1582,8 @@ function M.import_all(state)
 
       if disk_content ~= doc.content then
         changed = changed + 1
-        if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-          require('overleaf.buffer').replace_content(doc.bufnr, disk_content)
-        else
-          M._sync_closed_doc(doc, disk_content)
-        end
+        -- The same merge as for a watcher event.
+        M._on_file_changed(path, doc)
       end
     end
   end
