@@ -260,6 +260,78 @@ UI's order. It can go before or alongside Phase 1.
   (recommended), with `tree_sort = 'overleaf'` for the old order? Should the main
   document be pinned to the top?
 
+## Decisions taken (advisor, 2026-10-12)
+
+The user delegated D1–D6 to an advisor (an Opus review of this spec against the
+code). Choices and the corrections they imply:
+
+- **D1. Overlapping edits:** all-or-nothing per external write.
+  - If any hunk of `diff(base, mine)` overlaps or touches any hunk of
+    `diff(base, theirs)` (closed intervals in base coordinates; identical hunks
+    count once), send nothing.
+  - Save the writer's version to a *uniquely named* conflict copy
+    (`<file>.overleaf-conflict.<n>`), leave the file and `_last_written` at
+    `theirs`, and `vim.notify` at WARN.
+  - Without overlap, apply the union of the disjoint hunks to `base` in
+    descending position order; `transform_ops` is not needed.
+  - Judge overlap with word-level diffs (`words = true`); use
+    `words = mode.tracked()` only for the final op that is sent.
+- **D2. Keep documents joined:** always, whenever `sync_dir` is set, with no
+  separate option.
+  - Remote ops for bufferless documents already flow (`init.lua` ~316-328), so
+    the change is to set `joined = true` and stop leaving (`sync.lua` ~764).
+  - Warn and fall back to a snapshot if a join fails (today that is only
+    logged at debug, `sync.lua` ~741).
+  - Required follow-ons the spec missed:
+    - `open_document` must attach the buffer to the existing `Document`
+      instead of creating a second one (`init.lua` ~687-696);
+    - `_rejoin_documents` must rejoin bufferless documents after a reconnect
+      (`init.lua` ~650-665);
+    - `Document:rejoin` must schedule a mirror write;
+    - `_sync_closed_doc` becomes "update `doc.content` and `submit_op`", with no
+      join or leave.
+  - With D2, `doc.content` is live, so Phase 2a's base is
+    `M._last_written[path]` for every document and theirs is `doc.content` (after
+    a synchronous `reconcile` when there is a buffer). Open and closed documents
+    then share one path.
+- **D3. Upload files created on disk:** off by default.
+  - When on, the allowlist is Overleaf's text-document extensions. Binary
+    uploads happen only for extensions the user lists.
+  - When off, `:Overleaf sync status`/`import` still list disk-only files.
+  - The user's own config should probably turn it on.
+- **D4. New files while suggesting:** create an empty document, then insert the
+  content through OT, so it is sent as a tracked insertion (the web editor does
+  the same).
+  - Hold anything that would be a binary upload (`mode.can_replace_files()`).
+  - A `review` collaborator's `createDoc` is refused by the server: catch that
+    and hold.
+- **D5. Offline edits:** do Phase 4, in reduced form.
+  - Keep a manifest of the sha256 of the last content written per path, at
+    `stdpath('state')/overleaf/<project_id>.json`, not inside the mirror.
+  - On connect, before `sync_all` overwrites a file:
+    1. disk equals server → nothing;
+    2. disk sha equals the manifest → server changed, overwrite;
+    3. server sha equals the manifest → only the disk changed, send it as an
+       edit (mode-gated);
+    4. otherwise → conflict copy of the disk version, write the server version,
+       warn.
+- **D6. Tree order:**
+  - folders first, then documents and files interleaved, case-insensitive;
+  - natural (`fig2` < `fig10`) only if Overleaf's web editor does that — check
+    on the sandbox; it may be plain `localeCompare`;
+  - keep `'overleaf'` storage order as an option, and drop the comparator
+    function;
+  - no main-document pin: mark it in the tree instead.
+  - The line-to-entry lookup is also duplicated in `init.lua` ~1066 (the rename
+    picker).
+
+Other corrections from the same review:
+- Phase 3's ignore list must include the conflict copies.
+- `search.lua` searches the stale content of closed documents today; D2 fixes
+  that.
+- Phase 2's base is only right when the writer re-reads before writing.
+  Claude Code does; document the limitation for other tools.
+
 ## Mitigation until this ships
 
 - Open in Neovim the documents an agent will edit. Open documents get live

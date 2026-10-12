@@ -118,6 +118,42 @@ the subtle part; it needs a live check in the sandbox with track changes on.
 - **D8. Granularity:** follow Neovim's undo steps (recommended), or one step per
   OT flush, which is coarser and simpler?
 
+## Decisions taken (advisor, 2026-10-12)
+
+- **D7:** as recommended: map `u`, `<C-r>`, `U` and neutralise native undo.
+  Tested on Neovim 0.12.5: applying a change under `undolevels=-1` clears native
+  history in normal mode, mid-insert (the insert carries on, and later typing
+  becomes a new native step), and on a buffer that is not current.
+  - Apply the trick to *every* buffer write that is not local typing:
+    - `apply_ops` for remote ops;
+    - the full-buffer fallback in `apply_remote`;
+    - `Document:rejoin`'s `set_lines`;
+    - the file-restore `set_lines`;
+    - the history's own undo and redo.
+- **D8:** as recommended: groups follow Neovim's undo steps (`seq_cur` read when
+  `reconcile` runs). Macros and mappings within one tick merge into one group.
+  An insert interrupted by a remote op becomes two groups, so a group never
+  straddles a remote op.
+
+Corrections from that review:
+- Transform the stacks by `ops_to_apply` (the op applied to `doc.content`,
+  `document.lua` ~261), not by `update.op`.
+- Undo and redo must not go through `reconcile`, which would record the inverse
+  as a new group and clear redo. Instead:
+  1. reconcile synchronously;
+  2. apply the inverse to `doc.content` and to the buffer under
+     `applying_remote` and `undolevels=-1`;
+  3. `submit_op(inverse)`.
+- `invert` of a multi-component op reverses the component order.
+- Neither `apply_ops` nor `ot.apply` checks deleted text today, so add that
+  check rather than copy an assertion style.
+- This depends on the OT fixes F1, F2 and F4 in `docs/bug-hunt-2026-10-12.md`.
+  `transform_ops` is currently wrong for multi-component ops, and the undo stack
+  would hit that constantly.
+- Tracked changes: Overleaf's RangesTracker most likely treats deleting your own
+  tracked insertion as retracting it. A plain op with `meta.tc` is probably
+  enough, but check it live.
+
 ## Execution notes
 
 This is subtle OT and concurrency work. Have a strong model plan or review it,
