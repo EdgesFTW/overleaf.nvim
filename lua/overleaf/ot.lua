@@ -85,6 +85,20 @@ function M.apply(content, ops)
   return content
 end
 
+--- Invert sequential components against the text each component saw.
+function M.invert(ops, content_before)
+  local inverses = {}
+  local content = content_before
+  for _, op in ipairs(ops) do
+    local inverse = { p = op.p }
+    if op.i then inverse.d = op.i end
+    if op.d then inverse.i = op.d end
+    if inverse.i or inverse.d then table.insert(inverses, 1, inverse) end
+    content = M.apply(content, { op })
+  end
+  return inverses
+end
+
 -- Overleaf's document-updater replaces every UTF-16 surrogate in inserted text
 -- with U+FFFD (UpdateManager._sanitizeUpdate), so an emoji or a math letter such
 -- as 𝔸 is stored as two U+FFFD. Sending the real character makes the hash we
@@ -128,8 +142,10 @@ end
 local function append(dest, c)
   if c.i == '' or c.d == '' then return end
   local last = dest[#dest]
-  if last and last.i and c.i and last.p <= c.p and c.p <= last.p + M.u16_len(last.i) then
-    dest[#dest] = { p = last.p, i = inject(last.i, c.p - last.p, c.i) }
+  -- An undo insert stays apart from typing next to it: merged, it would no
+  -- longer match the tracked deletion it is meant to cancel.
+  if last and last.i and c.i and last.u == c.u and last.p <= c.p and c.p <= last.p + M.u16_len(last.i) then
+    dest[#dest] = { p = last.p, i = inject(last.i, c.p - last.p, c.i), u = c.u }
   elseif last and last.d and c.d and c.p <= last.p and last.p <= c.p + M.u16_len(c.d) then
     dest[#dest] = { p = c.p, d = inject(c.d, last.p - c.p, last.d) }
   else
@@ -153,7 +169,7 @@ local function tc(dest, c, other, side)
   if c.c or (not c.i and not c.d) then
     append(dest, c)
   elseif c.i then
-    append(dest, { p = tpos(c.p, other, side == 'right'), i = c.i })
+    append(dest, { p = tpos(c.p, other, side == 'right'), i = c.i, u = c.u })
   elseif other.i then
     local s = c.d
     if c.p < other.p then

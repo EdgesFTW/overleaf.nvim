@@ -3,6 +3,7 @@ local ot = require('overleaf.ot')
 local diff = require('overleaf.diff')
 local merge = require('overleaf.merge')
 local config = require('overleaf.config')
+local history = require('overleaf.history')
 
 local Document = {}
 Document.__index = Document
@@ -86,6 +87,7 @@ function Document.new(doc_id, path)
   self._send_seq = 0
   self._unacked_rejoins = 0
   self._catchup_failures = 0
+  self.history = history.new()
   return self
 end
 
@@ -112,6 +114,7 @@ function Document:join(callback)
       return
     end
     local content = table.concat(result.lines, '\n')
+    if self.content ~= nil and self.content ~= content then history.clear(self.history) end
     self.version = result.version
     self.content = content
     self.server_content = content
@@ -163,6 +166,11 @@ function Document:submit_op(ops)
     self.pending_ops = ops
   end
   if not self._rejoining then self:_schedule_flush() end
+end
+
+function Document:submit_external_op(ops)
+  history.transform(self.history, ops)
+  self:submit_op(ops)
 end
 
 function Document:_schedule_flush()
@@ -337,7 +345,8 @@ local function save_recovery(self, text)
   return result
 end
 
-function Document:_replace_buffer(content)
+function Document:_replace_buffer(content, clear_history)
+  if clear_history ~= false then history.clear(self.history) end
   if not self.bufnr or not vim.api.nvim_buf_is_valid(self.bufnr) then return end
   self.applying_remote = true
   local ok, err = pcall(function()
@@ -376,6 +385,7 @@ end
 --- buffer as it is and send nothing more for this document. The next rejoin
 --- (a reconnect) merges again.
 function Document:_keep_local_text(why)
+  history.clear(self.history)
   self.joined = false
   self._stopped = true
   self._rejoining = false
@@ -400,6 +410,7 @@ function Document:_accept_server(theirs, version, ranges, why)
     self:_keep_local_text(why)
     return false
   end
+  history.clear(self.history)
   self:_replace_buffer(theirs)
   self.server_content = theirs
   self.content = theirs
@@ -629,6 +640,7 @@ function Document:on_remote_op(update, apply_to_buffer)
     self.version = self.version + 1
     self.content = content
     if apply_to_buffer then apply_to_buffer(ops_to_apply) end
+    history.transform(self.history, ops_to_apply)
   end)
   if not ok then
     self.server_content = previous.server_content

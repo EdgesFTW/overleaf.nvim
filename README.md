@@ -196,11 +196,18 @@ If you accidentally paste only the value (starting with `s%3A...`), the plugin a
 | `:Overleaf comments` | List all comments |
 | `:Overleaf comments refresh` | Refresh comments from server |
 | `:Overleaf history` | View project history |
+| `:Overleaf undo` / `:Overleaf redo` | Undo or redo this client's edits in the current document |
 | `:Overleaf sync` | Sync all documents to/from disk |
 | `:Overleaf sync import` | Import external changes from disk to Overleaf |
 | `:Overleaf sync export` | Export all documents to disk |
 
 ### Default Keymaps
+
+In an Overleaf document, normal-mode `u` and `U` undo this client's edits;
+`<C-r>` redoes them. Counts work as in Vim. Remote edits and disk merges stay
+in place, and undo is unavailable in viewing mode. Visual-mode `u` keeps its
+usual lowercase behavior. Native undo-tree commands are not mapped to this
+history.
 
 All of these hang off `keymap_prefix`, `<leader>o` by default. Setting
 `keymap_prefix = '<leader>ol'` moves the whole set to `<leader>olc`,

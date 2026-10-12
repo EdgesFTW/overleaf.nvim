@@ -2,7 +2,39 @@
 
 ## Status
 
-Draft (2026-10-12). Bug confirmed; nothing implemented.
+Done 2026-10-12. Implemented by Codex, with an adversarial Opus review and the
+fixes from it; live-checked with two clients in the sandbox. The live checks covered:
+- undo after a collaborator inserted a line above our edit;
+- redo;
+- concurrent inserts at the same position;
+- `2u` across a remote edit;
+- native `:undo` after a remote change (harmless);
+- suggesting mode: retracting our own insertion and deletion, and redoing it.
+
+The implementation follows the advisor's corrections:
+- Undo and redo apply OT directly instead of re-entering `reconcile`.
+- Disk merges use `Document:submit_external_op`, which rebases the stacks instead of
+  recording a step.
+- Wholesale replacements clear the stacks.
+- `buffer.without_undo` wraps every buffer write that is not typing.
+
+Additions:
+- **The `u` flag.** Undo and redo inserts carry `u: true`. Overleaf's RangesTracker
+  (`applyInsertToChanges`) uses it to cancel a tracked deletion that the insert
+  restores, instead of suggesting the text again. Transforms keep the flag, and an
+  undo insert is never merged with typing next to it.
+- **Minimal steps.** Outside suggesting mode a step records only the characters it
+  changed. The token diff sent for several changes at once (`:s///g`, a macro)
+  replaces whole tokens. A step that owned those tokens could restore letters a
+  collaborator deleted afterwards.
+- **Fresh grouping per buffer.** A reopened or reloaded buffer starts a new group,
+  because Neovim restarts its undo numbering.
+
+Known limits:
+- In suggesting mode a step keeps the word-widened op it sent, so that undo matches
+  the tracked change. An undo can therefore restore letters of a replaced word that
+  a collaborator deleted later.
+- Comment components are not position-transformed (see `docs/ot-core-fixes-plan.md`).
 
 ## Problem
 

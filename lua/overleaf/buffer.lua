@@ -33,6 +33,10 @@ function M.create(doc, lines)
 
   doc.bufnr = bufnr
 
+  for lhs, action in pairs({ u = 'undo', U = 'undo', ['<C-r>'] = 'redo' }) do
+    vim.keymap.set('n', lhs, function() require('overleaf.history')[action](doc, vim.v.count1) end, { buffer = bufnr })
+  end
+
   -- :w clears modified flag and triggers compile (changes are already synced via OT)
   vim.api.nvim_create_autocmd('BufWriteCmd', {
     buffer = bufnr,
@@ -259,6 +263,10 @@ function M.reconcile(doc)
     doc:rejoin()
     return
   end
+  if doc.history then
+    local seq = vim.fn.undotree(doc.bufnr).seq_cur
+    require('overleaf.history').record(doc.history, ops, doc.content, seq, require('overleaf.mode').tracked())
+  end
   doc.content = updated
   doc:submit_op(ops)
   if replaced then M._show_replacements(doc) end
@@ -283,7 +291,12 @@ function M._show_replacements(doc)
   local ok = M.apply_ops(doc.bufnr, fix)
   local err
   if not ok then
-    ok, err = pcall(vim.api.nvim_buf_set_lines, doc.bufnr, 0, -1, false, vim.split(doc.content, '\n', { plain = true }))
+    ok, err = pcall(function()
+      M.without_undo(
+        doc.bufnr,
+        function() vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, vim.split(doc.content, '\n', { plain = true })) end
+      )
+    end)
   end
   doc.applying_remote = false
   -- check_content finds the difference later and merges.
@@ -299,6 +312,8 @@ function M.has_pending(doc) return doc._dirty ~= nil end
 ---@param bufnr number
 ---@param doc table Document instance
 function M.attach(bufnr, doc)
+  -- A new or reloaded buffer counts its undo steps from the start again.
+  if doc.history then require('overleaf.history').close(doc.history) end
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function(_, buf, _changedtick, first, _last_old, last_new)
       if doc.applying_remote then return end
@@ -331,34 +346,49 @@ function M.unlocked(bufnr, fn)
   if not ok then error(err, 0) end
 end
 
+--- Discard native undo entries for writes that did not come from typing.
+function M.without_undo(bufnr, fn)
+  local old = vim.bo[bufnr].undolevels
+  vim.bo[bufnr].undolevels = -1
+  local ok, err = pcall(fn)
+  if vim.api.nvim_buf_is_valid(bufnr) then vim.bo[bufnr].undolevels = old end
+  if not ok then error(err, 0) end
+end
+
 --- Apply OT ops to a buffer as in-place edits, so extmarks -- comment
 --- highlights, diagnostics -- follow the text instead of being swept away.
 ---@param bufnr number
 ---@param ops table[] applied in order, each against the text the last one left
 ---@return boolean ok, string|nil err
 function M.apply_ops(bufnr, ops)
-  for _, op in ipairs(ops) do
-    local ok, err = pcall(function()
-      if op.d then
-        local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-        local byte_p = ot.u16_to_byte(buf_content, op.p)
-        if buf_content:sub(byte_p + 1, byte_p + #op.d) ~= op.d then
-          error('Delete component does not match buffer text')
+  local applied, failure = true, nil
+  M.without_undo(bufnr, function()
+    for _, op in ipairs(ops) do
+      local ok, err = pcall(function()
+        if op.d then
+          local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+          local byte_p = ot.u16_to_byte(buf_content, op.p)
+          if buf_content:sub(byte_p + 1, byte_p + #op.d) ~= op.d then
+            error('Delete component does not match buffer text')
+          end
+          local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
+          local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
+          vim.api.nvim_buf_set_text(bufnr, start_row, start_col, end_row, end_col, { '' })
         end
-        local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
-        local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
-        vim.api.nvim_buf_set_text(bufnr, start_row, start_col, end_row, end_col, { '' })
+        if op.i then
+          local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+          local byte_p = ot.u16_to_byte(buf_content, op.p)
+          local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
+          vim.api.nvim_buf_set_text(bufnr, row, col, row, col, vim.split(op.i, '\n', { plain = true }))
+        end
+      end)
+      if not ok then
+        applied, failure = false, err
+        break
       end
-      if op.i then
-        local buf_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-        local byte_p = ot.u16_to_byte(buf_content, op.p)
-        local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
-        vim.api.nvim_buf_set_text(bufnr, row, col, row, col, vim.split(op.i, '\n', { plain = true }))
-      end
-    end)
-    if not ok then return false, err end
-  end
-  return true, nil
+    end
+  end)
+  return applied, failure
 end
 
 --- Make the buffer hold `content`, changing only the text that differs.
@@ -373,7 +403,10 @@ function M.replace_content(bufnr, content)
 
   local ok = M.apply_ops(bufnr, diff.ops(current, content))
   if not ok or table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n') ~= content then
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(content, '\n', { plain = true }))
+    M.without_undo(
+      bufnr,
+      function() vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(content, '\n', { plain = true })) end
+    )
   end
 end
 

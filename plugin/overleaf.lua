@@ -32,6 +32,8 @@ local subcommands = {
     end
   end,
   history = function() require('overleaf').history() end,
+  undo = function(_, count) require('overleaf').undo(count) end,
+  redo = function(_, count) require('overleaf').redo(count) end,
   sync = function(args)
     if args == 'import' then
       require('overleaf').sync_import()
@@ -70,7 +72,7 @@ vim.api.nvim_create_user_command('Overleaf', function(opts)
 
   local handler = subcommands[sub]
   if handler then
-    handler(args)
+    handler(args, opts.count)
   else
     vim.notify(
       'Unknown subcommand: ' .. sub .. '\nAvailable: ' .. table.concat(vim.tbl_keys(subcommands), ', '),
@@ -79,6 +81,7 @@ vim.api.nvim_create_user_command('Overleaf', function(opts)
   end
 end, {
   nargs = '*',
+  count = 1,
   desc = 'Overleaf commands',
   complete = function(arglead, line, _)
     local parts = vim.split(line, '%s+', { trimempty = true })

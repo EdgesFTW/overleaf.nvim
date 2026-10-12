@@ -651,10 +651,10 @@ local function apply_merged(doc, theirs, merged)
   if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
     -- Shown the way a remote edit is: the change is already in doc.content,
     -- so the buffer must not diff it a second time.
-    local ok, err = pcall(doc._replace_buffer, doc, content)
+    local ok, err = pcall(doc._replace_buffer, doc, content, false)
     if not ok then config.log('warn', 'Could not show the disk edit to %s in its buffer: %s', doc.path, err) end
   end
-  doc:submit_op(ops)
+  doc:submit_external_op(ops)
   config.log('info', 'Synced external change: %s', doc.path)
   if replaced then
     config.log('warn', 'Characters outside the Basic Multilingual Plane in %s were stored as U+FFFD', doc.path)
@@ -752,7 +752,7 @@ function M._sync_joined_doc(doc, new_content)
   local ops, replaced = ot.sanitize_inserts(diff.ops(doc.content, new_content, 0, { words = mode.tracked() }))
   if #ops == 0 then return end
   doc.content = ot.apply(doc.content, ops)
-  doc:submit_op(ops)
+  doc:submit_external_op(ops)
   config.log('info', 'Synced external change: %s', doc.path)
   -- Emoji are stored as U+FFFD; put what Overleaf has back on disk.
   if replaced then
@@ -782,6 +782,7 @@ function M._sync_closed_doc(doc, new_content, callback)
   local base = M._last_written[path]
   M._last_written[path] = new_content
   local function snapshot(text, version)
+    if doc.history then require('overleaf.history').clear(doc.history) end
     doc.content = text
     doc.server_content = text
     doc.version = version
@@ -1721,6 +1722,9 @@ function M.sync_all(state, project_tree, callback)
         return on_done()
       end
       local content = table.concat(result.lines, '\n')
+      if doc.history and doc.content ~= nil and doc.content ~= content then
+        require('overleaf.history').clear(doc.history)
+      end
       doc.content = content
       doc.server_content = content
       doc.version = result.version

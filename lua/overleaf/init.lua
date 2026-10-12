@@ -538,6 +538,7 @@ function M._setup_event_handlers()
           M._state.documents[old_id] = nil
           M._state.documents[new_id] = old_doc
           old_doc.doc_id = new_id
+          require('overleaf.history').clear(old_doc.history)
           old_doc.joined = false
           old_doc.inflight_op = nil
           old_doc.pending_ops = nil
@@ -988,7 +989,7 @@ function M._detach_on_close(doc, bufnr)
         -- a disk edit not processed yet. Show the document's text; the watcher
         -- (or the mirror write's check) merges any disk edit as usual.
         buffer.attach(bufnr, doc)
-        local ok, err = pcall(doc._replace_buffer, doc, doc.content)
+        local ok, err = pcall(doc._replace_buffer, doc, doc.content, false)
         if not ok then config.log('warn', 'Could not restore %s after a reload: %s', doc.path, err) end
         vim.bo[bufnr].modified = false
         if not mode.writable() then vim.bo[bufnr].modifiable = false end
@@ -2232,6 +2233,20 @@ function M.sync_export()
 end
 
 function M.sync_status() sync.status(project._project_tree) end
+
+local function history_command(action, count)
+  local bufnr = vim.api.nvim_get_current_buf()
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr == bufnr then
+      require('overleaf.history')[action](doc, count)
+      return
+    end
+  end
+  config.log('warn', 'Not an Overleaf document')
+end
+
+function M.undo(count) history_command('undo', count or 1) end
+function M.redo(count) history_command('redo', count or 1) end
 
 function M._teardown(stop_bridge, callback)
   -- Stop auto-reconnect
