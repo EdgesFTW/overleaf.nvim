@@ -19,6 +19,7 @@ test-node:
 	node tests/node/integration.test.js
 	node tests/node/synctex-rewrite.test.js
 	node tests/node/bridge-security.test.js
+	node tests/node/socket-events.test.js
 
 lint:
 	luacheck lua/ tests/ plugin/
