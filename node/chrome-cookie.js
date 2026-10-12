@@ -357,40 +357,44 @@ function cookieDomainForQuery() {
 }
 
 // Every overleaf_session2 row in one profile's cookie db, with its timestamps.
-function queryProfileCookies(cookiesDb) {
-  const tmpDb = path.join(os.tmpdir(), `overleaf_cookies_${process.pid}_${Math.abs(hashString(cookiesDb))}.db`);
+function withCopiedCookieDb(cookiesDb, callback) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-cookie-'));
+  const tmpDb = path.join(tmpDir, 'Cookies');
   try {
     fs.copyFileSync(cookiesDb, tmpDb);
-  } catch (e) {
-    return [];
-  }
-  try {
-    const query =
-      `SELECT name, hex(encrypted_value), creation_utc, last_access_utc, expires_utc ` +
-      `FROM cookies WHERE host_key LIKE '%${cookieDomainForQuery()}' AND name = 'overleaf_session2';`;
-    const out = execSync(`sqlite3 "${tmpDb}" "${query}"`, { encoding: 'utf-8' }).trim();
-    if (!out) return [];
-    return out.split('\n').map((line) => {
-      const [name, hexValue, creation, lastAccess, expires] = line.split('|');
-      return {
-        name,
-        hexValue,
-        creation: chromeTimeToUnixMs(creation),
-        lastAccess: chromeTimeToUnixMs(lastAccess),
-        expires: chromeTimeToUnixMs(expires),
-      };
-    }).filter((r) => r.hexValue);
-  } catch (e) {
-    return [];
+    for (const suffix of ['-wal', '-shm']) {
+      if (fs.existsSync(cookiesDb + suffix)) {
+        fs.copyFileSync(cookiesDb + suffix, tmpDb + suffix);
+      }
+    }
+    return callback(tmpDb);
   } finally {
-    try { fs.unlinkSync(tmpDb); } catch (e) { /* ignore */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
-function hashString(str) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
-  return h;
+function queryProfileCookies(cookiesDb) {
+  try {
+    return withCopiedCookieDb(cookiesDb, (tmpDb) => {
+      const query =
+        `SELECT name, hex(encrypted_value), creation_utc, last_access_utc, expires_utc ` +
+        `FROM cookies WHERE host_key LIKE '%${cookieDomainForQuery()}' AND name = 'overleaf_session2';`;
+      const out = execSync(`sqlite3 "${tmpDb}" "${query}"`, { encoding: 'utf-8' }).trim();
+      if (!out) return [];
+      return out.split('\n').map((line) => {
+        const [name, hexValue, creation, lastAccess, expires] = line.split('|');
+        return {
+          name,
+          hexValue,
+          creation: chromeTimeToUnixMs(creation),
+          lastAccess: chromeTimeToUnixMs(lastAccess),
+          expires: chromeTimeToUnixMs(expires),
+        };
+      }).filter((r) => r.hexValue);
+    });
+  } catch (e) {
+    return [];
+  }
 }
 
 // Search every profile of every detected browser. Newest session first, so the
@@ -462,10 +466,7 @@ async function extractFrom(cookiesDb) {
 
   const { keyV10, keyV11 } = getEncryptionKeys();
 
-  const tmpDb = path.join(os.tmpdir(), 'overleaf_chrome_cookies_' + process.pid + '.db');
-  fs.copyFileSync(cookiesDb, tmpDb);
-
-  try {
+  return withCopiedCookieDb(cookiesDb, (tmpDb) => {
     // Extract domain from OVERLEAF_URL for self-hosted instances
     let cookieDomain = 'overleaf.com';
     if (process.env.OVERLEAF_URL) {
@@ -497,9 +498,7 @@ async function extractFrom(cookiesDb) {
     }
 
     return `${name}=${value}`;
-  } finally {
-    try { fs.unlinkSync(tmpDb); } catch (e) { /* ignore */ }
-  }
+  });
 }
 
 module.exports = {
@@ -513,5 +512,6 @@ module.exports = {
     decryptCookieValue,
     normalizeV11Key,
     ensureSqlite3Available,
+    withCopiedCookieDb,
   },
 };

@@ -7,8 +7,9 @@ const SocketManager = require('./socket');
 const { getOverleafCookie, listProfiles } = require('./chrome-cookie');
 
 // Redirect console.log to stderr (stdout is the RPC channel)
-const origLog = console.log;
-console.log = (...args) => console.error('[bridge]', ...args);
+if (require.main === module) {
+  console.log = (...args) => console.error('[bridge]', ...args);
+}
 
 const BASE_URL = process.env.OVERLEAF_URL || 'https://www.overleaf.com';
 
@@ -44,53 +45,115 @@ function sendEvent(event, data) {
 // is not a 200. Writing whatever the server returned -- an error page, or
 // nothing at all -- produces a file that looks fine to the caller and is
 // garbage to whatever opens it, which is how the 0-byte PDF bug worked.
-function fetchToFile(url, cookie, destPath, redirectsLeft = 5) {
+function redirectPolicy(fromUrl, toUrl, originalOrigin = new URL(fromUrl).origin) {
+  const from = new URL(fromUrl);
+  const to = new URL(toUrl, from);
+  if (from.protocol === 'https:' && to.protocol === 'http:') {
+    throw { code: 'DOWNLOAD_FAILED', message: 'Refusing HTTPS to HTTP download redirect' };
+  }
+  if (to.protocol !== 'http:' && to.protocol !== 'https:') {
+    throw { code: 'DOWNLOAD_FAILED', message: `Unsupported download redirect protocol: ${to.protocol}` };
+  }
+  return { url: to.href, sendCookie: to.origin === originalOrigin };
+}
+
+function fetchToFile(url, cookie, destPath, redirectsLeft = 5, originalOrigin = new URL(url).origin, timeoutMs = 60000) {
   const fs = require('fs');
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject({ code: 'DOWNLOAD_FAILED', message: `Unsupported download protocol: ${parsed.protocol}` });
+      return;
+    }
     const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
-    httpModule.get({
+    const partPath = destPath + '.part';
+    let req;
+    let res;
+    let ws;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      if (req) req.destroy();
+      if (res) res.destroy();
+      const done = () => fs.rm(partPath, { force: true }, () => reject({
+        code: 'DOWNLOAD_FAILED', message: error.message || String(error),
+      }));
+      if (ws && !ws.closed) {
+        ws.once('close', done);
+        ws.destroy();
+      } else {
+        done();
+      }
+    };
+    try { req = httpModule.get({
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
       path: parsed.pathname + parsed.search,
-      headers: { 'Cookie': cookie },
-    }, (res) => {
+      headers: parsed.origin === originalOrigin ? { Cookie: cookie } : {},
+    }, (response) => {
+      res = response;
+      if (settled) { res.destroy(); return; }
+      res.on('error', fail);
+      res.on('aborted', () => fail(new Error('Download response aborted')));
+      res.setTimeout(timeoutMs, () => fail(new Error('Download timed out')));
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        res.resume();
         if (redirectsLeft <= 0) {
-          reject({ code: 'DOWNLOAD_FAILED', message: 'Too many redirects' });
+          fail(new Error('Too many redirects'));
           return;
         }
-        resolve(fetchToFile(new URL(res.headers.location, url).href, cookie, destPath, redirectsLeft - 1));
+        let next;
+        try { next = redirectPolicy(url, res.headers.location, originalOrigin); } catch (e) { fail(e); return; }
+        settled = true;
+        res.destroy();
+        resolve(fetchToFile(next.url, cookie, destPath, redirectsLeft - 1, originalOrigin, timeoutMs));
         return;
       }
       if (res.statusCode !== 200) {
-        res.resume();
-        reject({ code: 'DOWNLOAD_FAILED', message: `Download failed with status ${res.statusCode}` });
+        fail(new Error(`Download failed with status ${res.statusCode}`));
         return;
       }
       // Written only for a confirmed 200, so a failure leaves no partial file.
       // Staged through a sibling and renamed, which is atomic within a
       // directory: a PDF viewer watching destPath for changes sees either the
       // previous build or the new one, never a truncated stream.
-      const partPath = destPath + '.part';
-      const ws = fs.createWriteStream(partPath, { mode: 0o600 });
+      try { ws = fs.createWriteStream(partPath, { mode: 0o600 }); } catch (e) { fail(e); return; }
+      ws.on('error', fail);
       res.pipe(ws);
       ws.on('finish', () => {
         ws.close(() => {
+          if (settled) return;
           try {
             fs.renameSync(partPath, destPath);
+            settled = true;
             resolve();
           } catch (e) {
-            reject({ code: 'DOWNLOAD_FAILED', message: `Could not replace ${destPath}: ${e.message}` });
+            fail(new Error(`Could not replace ${destPath}: ${e.message}`));
           }
         });
       });
-      ws.on('error', (e) => {
-        fs.unlink(partPath, () => reject(e));
-      });
-    }).on('error', reject);
+    }); } catch (e) { fail(e); return; }
+    req.on('error', fail);
+    req.setTimeout(timeoutMs, () => fail(new Error('Download timed out')));
   });
+}
+
+function downloadPath(dir, fileName) {
+  const path = require('path');
+  if (typeof fileName !== 'string' || !fileName || fileName === '.' || fileName === '..' || fileName.includes('\0')) {
+    throw { code: 'INVALID_PARAM', message: 'Invalid download file name' };
+  }
+  const baseName = path.basename(fileName);
+  if (!baseName || baseName === '.' || baseName === '..') {
+    throw { code: 'INVALID_PARAM', message: 'Invalid download file name' };
+  }
+  const root = path.resolve(dir);
+  const dest = path.resolve(root, 'overleaf_' + baseName);
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  if (!dest.startsWith(prefix)) {
+    throw { code: 'INVALID_PARAM', message: 'Download path escapes output directory' };
+  }
+  return dest;
 }
 
 // Downloads default to a private per-user directory rather than a shared
@@ -278,7 +341,7 @@ const handlers = {
     }
     const fs = require('fs');
     const path = require('path');
-    const destPath = path.join(downloadDir(outputDir), 'overleaf_' + (fileName || 'download'));
+    const destPath = downloadPath(downloadDir(outputDir), fileName === undefined ? 'download' : fileName);
     if (synctexRoot === undefined || synctexRoot === null) {
       await fetchToFile(url, cookie, destPath);
       return { path: destPath };
@@ -305,7 +368,7 @@ const handlers = {
       throw { code: 'MISSING_PARAM', message: 'cookie, projectId, and fileId are required' };
     }
     const dir = downloadDir(outputDir);
-    const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || fileId));
+    const tmpPath = downloadPath(dir, fileName === undefined ? fileId : fileName);
     await fetchToFile(`${BASE_URL}/project/${projectId}/file/${fileId}`, cookie, tmpPath);
     return { path: tmpPath };
   },
@@ -532,41 +595,45 @@ async function handleMessage(line) {
   }
 }
 
-// stdin line reader
-const rl = readline.createInterface({
-  input: process.stdin,
-  terminal: false,
-});
+if (require.main === module) {
+  // stdin line reader
+  const rl = readline.createInterface({
+    input: process.stdin,
+    terminal: false,
+  });
 
-rl.on('line', (line) => {
-  if (line.trim()) {
-    handleMessage(line.trim());
-  }
-});
+  rl.on('line', (line) => {
+    if (line.trim()) {
+      handleMessage(line.trim());
+    }
+  });
 
-rl.on('close', () => {
-  console.log('stdin closed');
-  stdinClosed = true;
-  if (socketManager) {
-    socketManager.disconnect();
-    socketManager = null;
-  }
-  maybeExit();
-  // Force exit after 5s if pending requests don't complete
-  setTimeout(() => process.exit(0), 5000).unref();
-});
+  rl.on('close', () => {
+    console.log('stdin closed');
+    stdinClosed = true;
+    if (socketManager) {
+      socketManager.disconnect();
+      socketManager = null;
+    }
+    maybeExit();
+    // Force exit after 5s if pending requests don't complete
+    setTimeout(() => process.exit(0), 5000).unref();
+  });
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received');
-  if (socketManager) {
-    socketManager.disconnect();
-  }
-  process.exit(0);
-});
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM received');
+    if (socketManager) {
+      socketManager.disconnect();
+    }
+    process.exit(0);
+  });
 
-process.on('uncaughtException', (err) => {
-  console.log('Uncaught exception:', err.message);
-  sendEvent('error', { message: err.message });
-});
+  process.on('uncaughtException', (err) => {
+    console.log('Uncaught exception:', err.message);
+    sendEvent('error', { message: err.message });
+  });
 
-console.log('Bridge started');
+  console.log('Bridge started');
+}
+
+module.exports = { _internal: { redirectPolicy, downloadPath, fetchToFile } };

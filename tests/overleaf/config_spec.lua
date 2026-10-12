@@ -45,6 +45,23 @@ describe('config', function()
   end)
 
   describe('load_cookie', function()
+    it('redacts the entire cookie value in debug logs', function()
+      local tmp = vim.fn.tempname()
+      local f = assert(io.open(tmp, 'w'))
+      f:write('OVERLEAF_COOKIE=overleaf_session2=s%3Asecret_value\n')
+      f:close()
+      local old_notify = vim.notify
+      local messages = {}
+      vim.notify = function(message) table.insert(messages, message) end
+      config.setup({ cookie = nil, env_file = tmp, log_level = 'debug' })
+      config.load_cookie()
+      vim.notify = old_notify
+      vim.fn.delete(tmp)
+      assert.are.equal(1, #messages)
+      assert.is_truthy(messages[1]:find('overleaf_session2=<redacted, 16 chars>', 1, true))
+      assert.is_nil(messages[1]:find('s%3Asecret_value', 1, true))
+    end)
+
     it('returns cookie metadata when cookie is set in config', function()
       config.setup({ cookie = 'overleaf_session2=s%3Afrom_config' })
       local cookie, meta = config.load_cookie({ return_metadata = true })

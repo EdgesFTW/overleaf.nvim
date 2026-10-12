@@ -53,14 +53,10 @@ function M.get() return M._config end
 local function cookie_preview(cookie)
   if not cookie or cookie == '' then return '<empty>' end
 
-  local key, value = cookie:match('^([^=]+)=(.+)$')
-  if key and value then
-    if #value <= 12 then return key .. '=' .. value end
-    return string.format('%s=%s...%s...', key, value:sub(1, 4), value:sub(5, 12))
-  end
+  local key, value = cookie:match('^([^=]+)=(.*)$')
+  if key and value then return string.format('%s=<redacted, %d chars>', key, #value) end
 
-  if #cookie <= 16 then return cookie end
-  return cookie:sub(1, 16) .. '...'
+  return string.format('<unnamed>=<redacted, %d chars>', #cookie)
 end
 
 local function resolve_cookie_paths(env_file)

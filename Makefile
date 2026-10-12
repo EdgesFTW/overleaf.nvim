@@ -18,6 +18,7 @@ test-node:
 	node tests/node/auth-cookie.test.js
 	node tests/node/integration.test.js
 	node tests/node/synctex-rewrite.test.js
+	node tests/node/bridge-security.test.js
 
 lint:
 	luacheck lua/ tests/ plugin/
