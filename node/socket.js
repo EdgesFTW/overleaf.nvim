@@ -176,13 +176,31 @@ class SocketManager {
       this.sendEvent('disconnect', { reason: `force disconnect: ${message}` });
     });
 
-    // File tree events (forward for future use)
+    // File tree events
     this.socket.on('reciveNewDoc', (parentFolderId, doc, meta, userId) => {
       this.sendEvent('reciveNewDoc', { parentFolderId, doc, meta: meta || {} });
     });
 
     this.socket.on('reciveNewFile', (parentFolderId, file, meta, userId) => {
       this.sendEvent('reciveNewFile', { parentFolderId, file, meta: meta || {} });
+    });
+
+    this.socket.on('reciveNewFolder', (parentFolderId, folder, meta, userId) => {
+      this.sendEvent('reciveNewFolder', { parentFolderId, folder, meta: meta || {} });
+    });
+
+    this.socket.on('reciveEntityRename', (entityId, newName, meta) => {
+      this.sendEvent('reciveEntityRename', { entityId, newName, meta: meta || {} });
+    });
+
+    this.socket.on('reciveEntityMove', (entityId, parentFolderId, meta) => {
+      // Some server versions include the old and new parent IDs separately.
+      this.sendEvent('reciveEntityMove', {
+        entityId,
+        parentFolderId,
+        newParentFolderId: typeof meta === 'string' ? meta : undefined,
+        meta: typeof meta === 'object' && meta !== null ? meta : {},
+      });
     });
 
     this.socket.on('removeEntity', (entityId, meta) => {

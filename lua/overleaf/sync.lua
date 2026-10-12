@@ -74,6 +74,7 @@ function M.stop()
   end
   M._file_timers = {}
   M._files = {}
+  M._last_written = {}
   M._last_uploaded = {}
   M._uploading = {}
   M._held = {}
@@ -239,8 +240,13 @@ end
 
 --- Stop watching a specific document's file
 ---@param doc table Document instance
-function M.unwatch(doc)
+function M.unwatch(doc, cancel_write)
   if not M._sync_dir then return end
+
+  if cancel_write and M._write_timers[doc.doc_id] then
+    vim.fn.timer_stop(M._write_timers[doc.doc_id])
+    M._write_timers[doc.doc_id] = nil
+  end
 
   local path = M._sync_dir .. '/' .. doc.path
   local w = M._watchers[path]
@@ -251,6 +257,37 @@ function M.unwatch(doc)
     end
     M._watchers[path] = nil
   end
+end
+
+--- Follow a document path change without rewriting its mirrored content.
+---@param old_path string previous Overleaf path
+---@param doc table document already carrying its new path
+function M.move_doc(old_path, doc)
+  if not M._sync_dir or old_path == doc.path then return end
+  local from = M._sync_dir .. '/' .. old_path
+  local to = M._sync_dir .. '/' .. doc.path
+  local watcher = M._watchers[from]
+  if watcher then
+    if watcher.handle and not watcher.handle:is_closing() then
+      watcher.handle:stop()
+      watcher.handle:close()
+    end
+    M._watchers[from] = nil
+  end
+  if vim.uv.fs_stat(from) then
+    vim.fn.mkdir(vim.fn.fnamemodify(to, ':h'), 'p', SYNC_DIR_MODE)
+    local ok, err = os.rename(from, to)
+    if not ok then config.log('warn', 'Could not move mirror %s: %s', old_path, tostring(err)) end
+    -- Drop directories the move left empty (fs_rmdir refuses non-empty ones).
+    local dir = vim.fn.fnamemodify(from, ':h')
+    while #dir > #M._sync_dir and vim.uv.fs_rmdir(dir) do
+      dir = vim.fn.fnamemodify(dir, ':h')
+    end
+  end
+  M._last_written[to], M._last_written[from] = M._last_written[from], nil
+  M._deleted[to], M._deleted[from] = M._deleted[from], nil
+  M._held[to], M._held[from] = M._held[from], nil
+  if watcher then M.watch(doc) end
 end
 
 --- Remember a disk change the current mode would not let us send. It is kept,

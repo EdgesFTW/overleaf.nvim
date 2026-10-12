@@ -761,6 +761,24 @@ async function runTests() {
     assertEqual(evt.data.parentFolderId, 'root_folder', 'parent folder');
   });
 
+  await test('folder creation, rename and move events are forwarded', async () => {
+    bridge.clearEvents();
+    broadcastEvent('reciveNewFolder', 'root_folder', { _id: 'folder_new', name: 'drafts' }, {});
+    broadcastEvent('reciveEntityRename', 'folder_new', 'chapters', {});
+    broadcastEvent('reciveEntityMove', 'folder_new', 'folder_target', {});
+    await new Promise(r => setTimeout(r, 200));
+
+    const created = bridge.events.find(e => e.event === 'reciveNewFolder');
+    const renamed = bridge.events.find(e => e.event === 'reciveEntityRename');
+    const moved = bridge.events.find(e => e.event === 'reciveEntityMove');
+    assert(created && renamed && moved, 'all project structure events should be forwarded');
+    assertEqual(created.data.folder._id, 'folder_new', 'folder id');
+    assertEqual(created.data.parentFolderId, 'root_folder', 'folder parent');
+    assertEqual(renamed.data.entityId, 'folder_new', 'renamed entity');
+    assertEqual(renamed.data.newName, 'chapters', 'new name');
+    assertEqual(moved.data.parentFolderId, 'folder_target', 'new parent');
+  });
+
   await test('removeEntity event (normal, non-restore) is forwarded', async () => {
     bridge.clearEvents();
     // Real Overleaf signature: removeEntity(entityId, meta)

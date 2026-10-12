@@ -190,6 +190,7 @@ function Document:rejoin(attempt)
           self.applying_remote = false
         end)
       end
+      require('overleaf.sync').schedule_write(self)
     end)
   end, delay)
 end

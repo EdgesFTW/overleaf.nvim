@@ -208,7 +208,7 @@ function M._delete_entry()
       end
       config.log('info', 'Deleted: %s', entry.path)
       vim.schedule(function()
-        project.remove_entry(entry.id)
+        ol._remove_entity(entry.id)
         M.refresh()
       end)
     end)
@@ -245,20 +245,8 @@ function M._rename_entry()
         return
       end
       vim.schedule(function()
-        local old_path = entry.path
-        local updated = project.rename_entry(entry.id, new_name)
-        if updated then
-          if entry.type == 'file' then require('overleaf.sync').rename_file(old_path, updated) end
-          -- Update open buffer name if it's a doc
-          if entry.type == 'doc' then
-            local doc = ol._state.documents[entry.id]
-            if doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-              doc.path = updated.path
-              vim.api.nvim_buf_set_name(doc.bufnr, require('overleaf.sync').buf_name(updated.path))
-            end
-          end
-          config.log('info', 'Renamed to: %s', updated.path)
-        end
+        local updated = ol._rename_entry(entry.id, new_name)
+        if updated then config.log('info', 'Renamed to: %s', updated.path) end
         M.refresh()
       end)
     end)

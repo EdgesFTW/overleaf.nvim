@@ -163,6 +163,34 @@ function M.rename_entry(entity_id, new_name)
   return nil
 end
 
+--- Move an entry (and its descendants) under a new parent folder.
+function M.move_entry(entity_id, parent_folder_id)
+  local entry = M.get_doc_by_id(entity_id)
+  if not entry then return nil end
+  if parent_folder_id == entity_id then return nil end
+  local parent_path = M.get_folder_path(parent_folder_id)
+  if parent_folder_id and parent_folder_id ~= M._root_folder_id and parent_path == '' then return nil end
+  if entry.type == 'folder' and parent_path:sub(1, #entry.path) == entry.path then return nil end
+  local parent_depth = -1
+  if parent_folder_id and parent_folder_id ~= M._root_folder_id then
+    parent_depth = M.get_doc_by_id(parent_folder_id).depth or 0
+  end
+  local old_path = entry.path
+  local new_path = parent_path .. entry.name .. (entry.type == 'folder' and '/' or '')
+  local depth_delta = parent_depth + 1 - (entry.depth or 0)
+  entry.path = new_path
+  entry.depth = (entry.depth or 0) + depth_delta
+  if entry.type == 'folder' then
+    for _, child in ipairs(M._project_tree) do
+      if child ~= entry and child.path:sub(1, #old_path) == old_path then
+        child.path = new_path .. child.path:sub(#old_path + 1)
+        child.depth = (child.depth or 0) + depth_delta
+      end
+    end
+  end
+  return entry
+end
+
 --- Update an entry's ID (used for file-restore where the doc gets a new _id)
 function M.update_entry_id(old_id, new_id)
   for _, entry in ipairs(M._project_tree) do
@@ -176,9 +204,13 @@ end
 
 --- Remove an entry from the tree by ID
 function M.remove_entry(entity_id)
-  for i, entry in ipairs(M._project_tree) do
+  for _, entry in ipairs(M._project_tree) do
     if entry.id == entity_id then
-      table.remove(M._project_tree, i)
+      local prefix = entry.type == 'folder' and entry.path or nil
+      for j = #M._project_tree, 1, -1 do
+        local child = M._project_tree[j]
+        if child == entry or (prefix and child.path:sub(1, #prefix) == prefix) then table.remove(M._project_tree, j) end
+      end
       return true
     end
   end

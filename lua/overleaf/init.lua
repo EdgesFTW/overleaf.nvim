@@ -262,6 +262,10 @@ function M._get_cookie_fallback(callback)
 end
 
 function M._connect_project(cookie, project_id, project_name)
+  if M._state.project_id then
+    M._teardown(false, function() M._connect_project(cookie, project_id, project_name) end)
+    return
+  end
   config.log('info', 'Connecting to project: %s', project_name)
 
   -- Register event handlers before connecting
@@ -312,8 +316,114 @@ function M._connect_project(cookie, project_id, project_name)
   end)
 end
 
+local function tree_paths()
+  local paths = {}
+  for _, entry in ipairs(project._project_tree) do
+    paths[entry.id] = entry.path
+  end
+  return paths
+end
+
+-- Renaming a buffer works like :file, which leaves an unlisted placeholder
+-- buffer under the old name; drop it so renames don't accumulate strays.
+local function rename_buffer(bufnr, name)
+  local old = vim.api.nvim_buf_get_name(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, name)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if b ~= bufnr and not vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == old then
+      pcall(vim.api.nvim_buf_delete, b, { force = true })
+    end
+  end
+end
+
+local function reconcile_paths(old_paths)
+  for _, entry in ipairs(project._project_tree) do
+    local old_path = old_paths[entry.id]
+    if old_path and old_path ~= entry.path then
+      if entry.type == 'doc' then
+        local doc = M._state.documents[entry.id]
+        if doc then
+          doc.path = entry.path
+          if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+            rename_buffer(doc.bufnr, sync.buf_name(entry.path))
+            vim.b[doc.bufnr].overleaf_file = entry.path
+          end
+        end
+        sync.move_doc(old_path, doc or { doc_id = entry.id, path = entry.path })
+      elseif entry.type == 'file' then
+        sync.rename_file(old_path, entry)
+        for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+          if vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].overleaf_file == old_path then
+            rename_buffer(bufnr, sync.buf_name(entry.path))
+            vim.b[bufnr].overleaf_file = entry.path
+          end
+        end
+      end
+    end
+  end
+end
+
+function M._rename_entry(entity_id, new_name)
+  local entry = project.get_doc_by_id(entity_id)
+  if not entry or not new_name or new_name == entry.name then return entry end
+  local old_paths = tree_paths()
+  local updated = project.rename_entry(entity_id, new_name)
+  if updated then reconcile_paths(old_paths) end
+  return updated
+end
+
+function M._move_entry(entity_id, parent_folder_id)
+  local entry = project.get_doc_by_id(entity_id)
+  if not entry then return nil end
+  local old_paths = tree_paths()
+  local updated = project.move_entry(entity_id, parent_folder_id)
+  if updated then reconcile_paths(old_paths) end
+  return updated
+end
+
+function M._remove_entity(entity_id)
+  local entry = project.get_doc_by_id(entity_id)
+  if not entry then return end
+  local prefix = entry.type == 'folder' and entry.path or nil
+  for _, child in ipairs(project._project_tree) do
+    if child == entry or (prefix and child.path:sub(1, #prefix) == prefix) then
+      if child.type == 'doc' then
+        local doc = M._state.documents[child.id]
+        if doc then
+          sync.unwatch(doc, true)
+          M._state.documents[child.id] = nil
+          doc:leave(function() buffer.cleanup(doc) end)
+        end
+      elseif child.type == 'file' then
+        sync.forget_file(child)
+        for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+          if vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].overleaf_file == child.path then
+            vim.api.nvim_buf_delete(bufnr, { force = true })
+          end
+        end
+      end
+    end
+  end
+  project.remove_entry(entity_id)
+end
+
 function M._setup_event_handlers()
-  bridge.on_event('otUpdateApplied', function(data)
+  M._registered_handlers = M._registered_handlers or {}
+  local function on_event(name, handler)
+    local registered = M._registered_handlers[name]
+    if registered then
+      local handlers = bridge._event_handlers and bridge._event_handlers[name]
+      if not bridge._event_handlers then return end
+      for _, existing in ipairs(handlers or {}) do
+        if existing == registered then return end
+      end
+      bridge.on_event(name, registered)
+    else
+      M._registered_handlers[name] = handler
+      bridge.on_event(name, handler)
+    end
+  end
+  on_event('otUpdateApplied', function(data)
     -- Skip own-ACK events (no op field = acknowledgment for our own op)
     -- Our ACK is already handled by the applyOtUpdate callback → _on_ack()
     if not data.op then return end
@@ -328,7 +438,7 @@ function M._setup_event_handlers()
   end)
 
   -- The server pushes this when the main document is changed from any client.
-  bridge.on_event('rootDocUpdated', function(data)
+  on_event('rootDocUpdated', function(data)
     if data and data.docId then
       M._state.root_doc_id = data.docId
       local entry = project.get_doc_by_id(data.docId)
@@ -336,7 +446,7 @@ function M._setup_event_handlers()
     end
   end)
 
-  bridge.on_event('otUpdateError', function(data)
+  on_event('otUpdateError', function(data)
     config.log('debug', 'OT Error for doc %s: %s', data.doc or '?', data.message or '?')
     -- Only rejoin if connected (disconnect handler handles reconnect separately)
     if M._state.connected then
@@ -345,14 +455,14 @@ function M._setup_event_handlers()
     end
   end)
 
-  bridge.on_event('disconnect', function(data)
+  on_event('disconnect', function(data)
     if M._state.connected then config.log('warn', 'Disconnected: %s — reconnecting...', data.reason or 'unknown') end
     M._state.connected = false
     M._attempt_reconnect()
   end)
 
   -- File tree events
-  bridge.on_event('reciveNewDoc', function(data)
+  on_event('reciveNewDoc', function(data)
     if not data or not data.doc then return end
     local doc_info = data.doc
     local meta = data.meta or {}
@@ -422,14 +532,16 @@ function M._setup_event_handlers()
         end
       end
 
-      vim.schedule(function() require('overleaf.tree').refresh() end)
-      return
+      if old_id then
+        vim.schedule(function() require('overleaf.tree').refresh() end)
+        return
+      end
     end
 
     -- Normal new doc (not restore)
     local parent_path = project.get_folder_path(data.parentFolderId)
     local path = parent_path .. (doc_info.name or '')
-    if not project.path_exists(path) then
+    if not project.get_doc_by_id(new_id) and not project.path_exists(path) then
       local depth = 0
       if data.parentFolderId then
         for _, e in ipairs(project._project_tree) do
@@ -450,7 +562,49 @@ function M._setup_event_handlers()
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
 
-  bridge.on_event('reciveNewFile', function(data)
+  on_event('reciveNewFolder', function(data)
+    if not data or not data.folder then return end
+    local folder = data.folder
+    local id = folder._id or folder.id
+    if not id or project.get_doc_by_id(id) then return end
+    local parent_path = project.get_folder_path(data.parentFolderId)
+    local path = parent_path .. (folder.name or '') .. '/'
+    if project.path_exists(path) then return end
+    local parent = project.get_doc_by_id(data.parentFolderId)
+    project.add_entry({
+      id = id,
+      name = folder.name,
+      path = path,
+      type = 'folder',
+      depth = parent and parent.depth + 1 or 0,
+    })
+    vim.schedule(function() require('overleaf.tree').refresh() end)
+  end)
+
+  on_event('reciveEntityRename', function(data)
+    if not data then return end
+    local id = data.entityId or data.id or (type(data.entity) == 'table' and (data.entity._id or data.entity.id))
+    local name = data.newName or data.name
+    if type(name) == 'table' then name = name.newName or name.name end
+    if type(name) ~= 'string' then return end
+    if id and name and M._rename_entry(id, name) then
+      vim.schedule(function() require('overleaf.tree').refresh() end)
+    end
+  end)
+
+  on_event('reciveEntityMove', function(data)
+    if not data then return end
+    local id = data.entityId or data.id or (type(data.entity) == 'table' and (data.entity._id or data.entity.id))
+    local parent_id = data.newParentFolderId or data.parentFolderId or data.folderId
+    if type(data.meta) == 'table' then
+      parent_id = data.meta.newParentFolderId or data.meta.parentFolderId or parent_id
+    end
+    if id and parent_id and M._move_entry(id, parent_id) then
+      vim.schedule(function() require('overleaf.tree').refresh() end)
+    end
+  end)
+
+  on_event('reciveNewFile', function(data)
     if not data or not data.file then return end
     local file = data.file
     local new_id = file._id or file.id
@@ -489,7 +643,7 @@ function M._setup_event_handlers()
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
 
-  bridge.on_event('removeEntity', function(data)
+  on_event('removeEntity', function(data)
     if not data or not data.entityId then return end
     local meta = data.meta or {}
 
@@ -504,9 +658,7 @@ function M._setup_event_handlers()
     -- A fileRef replaced by an upload (ours or anyone's) arrives as
     -- removeEntity(old id, 'upload') followed by reciveNewFile(new id): the
     -- entry is dropped here and re-added, re-fetched and re-watched there.
-    local entry = project.get_doc_by_id(data.entityId)
-    if entry and entry.type == 'file' then sync.forget_file(entry) end
-    project.remove_entry(data.entityId)
+    M._remove_entity(data.entityId)
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
 
@@ -520,28 +672,28 @@ function M._setup_event_handlers()
     end
   end
 
-  bridge.on_event('newComment', function(data)
+  on_event('newComment', function(data)
     vim.schedule(function()
       require('overleaf.comments').on_new_comment(data)
       rerender_comments()
     end)
   end)
 
-  bridge.on_event('resolveThread', function(data)
+  on_event('resolveThread', function(data)
     vim.schedule(function()
       require('overleaf.comments').on_resolve_thread(data)
       rerender_comments()
     end)
   end)
 
-  bridge.on_event('reopenThread', function(data)
+  on_event('reopenThread', function(data)
     vim.schedule(function()
       require('overleaf.comments').on_reopen_thread(data)
       rerender_comments()
     end)
   end)
 
-  bridge.on_event('deleteThread', function(data)
+  on_event('deleteThread', function(data)
     vim.schedule(function()
       require('overleaf.comments').on_delete_thread(data)
       rerender_comments()
@@ -549,11 +701,11 @@ function M._setup_event_handlers()
   end)
 
   -- Collaborator cursor tracking
-  bridge.on_event('clientUpdated', function(data)
+  on_event('clientUpdated', function(data)
     vim.schedule(function() require('overleaf.cursors').on_client_updated(data) end)
   end)
 
-  bridge.on_event('clientDisconnected', function(data)
+  on_event('clientDisconnected', function(data)
     vim.schedule(function() require('overleaf.cursors').on_client_disconnected(data) end)
   end)
 end
@@ -1089,14 +1241,7 @@ function M.rename_entity()
           return
         end
         vim.schedule(function()
-          local updated = project.rename_entry(choice.id, new_name)
-          if updated and choice.type == 'doc' then
-            local doc = M._state.documents[choice.id]
-            if doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-              doc.path = updated.path
-              vim.api.nvim_buf_set_name(doc.bufnr, sync.buf_name(updated.path))
-            end
-          end
+          local updated = M._rename_entry(choice.id, new_name)
           if updated then config.log('info', 'Renamed to: %s', updated.path) end
           require('overleaf.tree').refresh()
         end)
@@ -1144,7 +1289,7 @@ function M.delete_entity()
         end
         config.log('info', 'Deleted: %s', choice.path)
         vim.schedule(function()
-          project.remove_entry(choice.id)
+          M._remove_entity(choice.id)
           require('overleaf.tree').refresh()
         end)
       end)
@@ -1946,7 +2091,7 @@ function M.sync_export()
   sync.export_all(M._state)
 end
 
-function M.disconnect()
+function M._teardown(stop_bridge, callback)
   -- Stop auto-reconnect
   M._reconnect.attempt = 0
   M._reconnect.in_progress = false
@@ -1956,6 +2101,10 @@ function M.disconnect()
   end
   bridge._on_unexpected_exit = nil
 
+  -- Prevent a deliberate socket disconnect from starting auto-reconnect.
+  M._state.connected = false
+  M._state.project_id = nil
+
   -- Stop file sync watchers
   remove_server_state(M._state.pdf_path)
   sync.stop()
@@ -1964,20 +2113,50 @@ function M.disconnect()
   pcall(function() require('overleaf.cursors').clear_all() end)
   pcall(function() require('overleaf.comments').clear_all() end)
 
-  -- Leave all documents
-  for _, doc in pairs(M._state.documents) do
-    doc:leave(function() buffer.cleanup(doc) end)
+  local tree = require('overleaf.tree')
+  if tree._bufnr and vim.api.nvim_buf_is_valid(tree._bufnr) then
+    vim.api.nvim_buf_delete(tree._bufnr, { force = true })
   end
+  tree._bufnr = nil
+  tree._tree_winnr = nil
+  tree._editor_winnr = nil
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].overleaf_file then
+      vim.api.nvim_buf_delete(bufnr, { force = true })
+    end
+  end
+
+  -- Leave all documents before changing the socket's project.
+  local documents = M._state.documents
   M._state.documents = {}
+  local remaining = 0
+  local finished = false
+  for _ in pairs(documents) do
+    remaining = remaining + 1
+  end
+  local function finish()
+    if finished then return end
+    finished = true
+    if stop_bridge then
+      bridge.stop()
+    else
+      bridge.request('disconnect', {}, function()
+        if callback then vim.schedule(callback) end
+      end)
+    end
+  end
+  for _, doc in pairs(documents) do
+    doc:leave(function()
+      buffer.cleanup(doc)
+      remaining = remaining - 1
+      if remaining == 0 then finish() end
+    end)
+  end
+  if remaining == 0 then finish() end
 
-  -- Disconnect bridge
-  bridge.stop()
-
-  M._state.connected = false
   M._state.project_name = nil
-  M._state.project_id = nil
   M._state.project_data = nil
-  M._state.csrf_token = nil
+  M._state.root_doc_id = nil
   M._state.pdf_path = nil
   M._state.pdf_opened = {}
   M._state.pdf_pid = nil
@@ -1987,9 +2166,19 @@ function M.disconnect()
   M._state.synctex_root = nil
   viewer.stop_watching()
   mode.reset()
+  project._project_tree = {}
+  project._root_folder_id = nil
+  M._pending_restore = nil
+
+  if stop_bridge then
+    M._state.csrf_token = nil
+    M._state.user_id = nil
+  end
 
   config.log('info', 'Disconnected')
 end
+
+function M.disconnect() M._teardown(true) end
 
 local MODE_NOTES = {
   editing = 'edits are applied as typed',
