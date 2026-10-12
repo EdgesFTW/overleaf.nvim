@@ -30,8 +30,8 @@ the original copyright.
 | Comments and suggestions survive external edits | A file rewritten on disk reached Overleaf as "delete the whole document, type it back" (a closed doc) or "delete everything between the first and last change" (an open one). Overleaf drops a comment or suggestion anchored to any text an op deletes, even when it is put straight back, so one changed word wiped every anchor in the file — the comment collapsed to an empty range, suggested insertions vanished and suggested deletions were displaced to the end. Changes are now diffed by word and only the words that differ are touched. See [Comments and suggestions](#comments-and-suggestions). |
 | Editing / suggesting / viewing modes | The client could only edit outright. `:Overleaf mode` adds Overleaf's other two: **suggesting** sends every edit as a tracked change, and **viewing** is read-only and sends nothing — from the buffer or from the disk mirror. Modes the server would reject (a reviewer's plain edits, a read-only collaborator) are never offered, and a project that forces tracking on for you is respected. See [Modes](#modes). |
 | Comment highlights follow the text | Highlight and "read comment at cursor" positions were recorded once at join and never updated, so after any edit above a comment the highlight drifted, the thread was no longer found under the cursor, and in text with accents the offsets (characters) were read as bytes. Positions are now read back from the extmarks that track the text. |
-| Inverse search (SyncTeX) | Ctrl+click in the PDF jumps the buffer to the line that produced it — the feature Overleaf's web editor has and this plugin did not. The server-side lookup cannot carry this direction, since nothing reports a raw click, so the build's SyncTeX database is mirrored next to the PDF and zathura's `Edit` signal is watched instead. See [SyncTeX inverse search](#synctex-inverse-search). |
-| Forward search (SyncTeX) | Overleaf's own double-click-to-PDF has no equivalent here: the plugin could compile but not say where the cursor landed. `:Overleaf forward` now asks Overleaf where a line ended up and moves the viewer there, highlighting the box. See [SyncTeX forward search](#synctex-forward-search). |
+| Inverse search (SyncTeX) | Viewer clicks jump to project source. Zathura and Evince use D-Bus signals; Okular uses an editor callback to the running Neovim. See [SyncTeX inverse search](#synctex-inverse-search). |
+| Forward search (SyncTeX) | `:Overleaf forward` moves zathura, Okular or Evince using the downloaded SyncTeX database. See [SyncTeX forward search](#synctex-forward-search). |
 | Compiling does not steal focus | Every compile relaunched the PDF viewer, so the window manager pulled focus away from Neovim — which makes compiling on `:w` unusable. The output is written to the same path on every build, so a viewer that reloads on change is already current; `pdf_auto_open` now launches it for the first compile only by default, and downloads are staged through a sibling file and renamed so a watching viewer never reads a half-written PDF. |
 | Relocatable keymap prefix | Every default key was hardcoded under `<leader>o`, and the documented `keys = false` escape hatch did not work (`opts.keys or true` is always truthy), so a collision with another `<leader>o` plugin could only be resolved by unmapping keys by hand. `keymap_prefix` moves the whole set, `keymaps = false` disables it, and the prefix is labelled in which-key when it is installed. |
 | `env_file` accepts `~` and `$VAR` | `io.open` takes paths literally, so `~/.overleaf.env` was read as a directory named `~` and silently failed. Same intent as unmerged [#23](https://github.com/richwomanbtc/overleaf.nvim/pull/23). |
@@ -259,7 +259,7 @@ require('overleaf').setup({
   -- 'always' after every compile, false never (':Overleaf pdf' opens it).
   pdf_auto_open = 'once',
 
-  -- Forward search drives the viewer over D-Bus, which only zathura supports.
+  -- Built-in viewer profile; zathura, okular and evince are supported.
   pdf_viewer = 'zathura',
 
   -- How this client changes the project, as in Overleaf's editor:
@@ -269,8 +269,7 @@ require('overleaf').setup({
   --   'viewing'        - read-only; nothing is sent
   mode = 'auto',
 
-  -- Ctrl+click in the PDF jumps the buffer to the line behind it. Set false to
-  -- skip downloading the SyncTeX database and watching the viewer.
+  -- Enable inverse search. The SyncTeX database is still downloaded when false.
   inverse_search = true,
 
   -- Local file sync directory for external tools like Claude Code (default: nil = disabled)
@@ -441,56 +440,90 @@ Highlights and "read comment at cursor" follow the text as it is edited.
 
 ## SyncTeX forward search
 
-`:Overleaf forward` (`<leader>os`) moves the PDF viewer to whatever the cursor is
-sitting on, and highlights the box the text was typeset into.
+`:Overleaf forward` (`<leader>os`) moves the PDF to the source at the cursor.
+It uses the `output.synctex.gz` downloaded beside the PDF after every compile.
+The search refers to the last compile, so editing without compiling can shift
+the position. Compiling on `:w` keeps the source and PDF together. A comment,
+preamble line or blank line may produce no output of its own; in that case the
+viewer may simply not move. Search works from files opened out of the mirror
+as well as live documents. The viewer resolves the source location itself;
+there is no Overleaf HTTP lookup or box highlight.
 
-It needs **zathura**, which is the one common Linux viewer that exposes `GotoPage`
-and `HighlightRects` on the session bus, plus `gdbus` and `busctl` to talk to it:
+Set `pdf_viewer` to `zathura`, `okular` or `evince` for a built-in profile. The
+command may be an absolute executable path. With `pdf_viewer = nil`, the PDF
+opens through the system default. Forward search then uses zathura only if one
+is already showing that PDF; otherwise it asks you to set `pdf_viewer` for the
+viewer you use. An unrecognised command opens the PDF and keeps zathura's
+D-Bus inverse listener for compatibility, but needs a profile table for
+forward search:
 
 ```lua
-require('overleaf').setup({
-  pdf_viewer = 'zathura',
-})
+pdf_viewer = {
+  name = 'sioyek',
+  open = { 'sioyek', '@pdf' },
+  forward = { 'sioyek', '--forward-search-file', '@file',
+    '--forward-search-line', '@line', '@pdf' },
+  inverse = { '--inverse-search', '@callback %f %l %c' },
+}
 ```
 
-The viewer the plugin launched is found by its pid; a zathura started by hand is
-found by asking every instance on the bus which document it has open, so an
-already-open window works too.
-
-Some notes on what it can and cannot do:
-
-- It resolves against the **last compile**, not the buffer. Edit without compiling
-  and the jump drifts by however much the text moved. Compiling on `:w` keeps them
-  together.
-- A line that produces no output of its own — a comment, a preamble line, a blank —
-  has no position, and Overleaf answers with an empty list rather than an error. The
-  plugin says so and leaves the viewer alone.
-- It works from files opened out of the mirror as well as from live documents.
-- Overleaf evicts old builds. Once that happens the lookup 404s and the plugin asks
-  for a recompile.
+This sioyek-style example is **untested**; adapt its flags to the installed
+version. Profile commands are argv lists. `@pdf` is the absolute PDF path,
+`@file` is the absolute source path recorded in the local SyncTeX database,
+`@line` and `@column` are 1-based, and `@callback` is the Neovim callback
+command. The optional `inverse` argv is inserted after the executable of the
+`open` command when inverse search is enabled; it is never added to `forward`,
+since a viewer that keeps a single instance (Okular's `--unique`) may refuse
+an editor command from a second invocation. Unknown placeholders and viewer
+syntax such as `%f` stay untouched. Put inverse flags in `inverse`, rather
+than `open`, so they disappear cleanly when `inverse_search = false`. A profile
+can set `forward = 'evince'` or
+`listen = 'zathura'` / `'evince'` for those D-Bus drivers. For a viewer with
+one running instance, `unique_bus` can name its well-known D-Bus owner; an
+owned name makes `open` omit the inverse arguments that instance would refuse.
 
 ## SyncTeX inverse search
 
-Ctrl+click anywhere in the PDF and the buffer jumps to the line that produced it,
-opening the document first if it is not already loaded.
+A viewer click jumps to the project document and line, opening it if needed.
+The modifier belongs to the viewer: zathura uses ctrl+click by default (set
+by `synctex-edit-modifier`), Okular uses shift+click in browse mode, and Evince
+uses ctrl+click. Like forward search, the result reflects the last compile.
 
-This runs on a different mechanism from forward search. There is no signal for a
-raw click, so the plugin cannot ask Overleaf where one landed; zathura will only
-report a click after resolving it itself. So each compile also downloads the
-build's `output.synctex.gz` next to the PDF, under the stem the viewer looks for
-(`x.pdf` → `x.synctex.gz`). zathura resolves the click against it and announces
-the result as an `Edit` signal on the session bus, which the plugin watches with
-`gdbus monitor`.
+Zathura reports an `Edit` signal over D-Bus. The plugin
+listens to this signal even for a zathura started by hand; it does not set
+zathura's `-x` editor command because one click would trigger both paths.
+Evince uses its D-Bus `SyncView` method and `SyncSource` signal. These two
+viewers need `gdbus`; zathura's instance discovery also needs `busctl`.
+GNOME Papers does not expose Evince's SyncTeX interface and is unsupported.
 
-The database records project files by their path inside Overleaf's build
-container, `/compile/./main.tex`, so the prefix is stripped to get back to
-`main.tex`. A click that lands in a TeX Live package rather than your own source
-is reported and otherwise ignored — there is no local file to open.
+Okular uses an editor command. The command runs
+`scripts/overleaf-inverse.lua` in a clean Neovim, which reads a hashed state
+file in the user's private runtime directory and sends the result by RPC to
+the running session. The file contains the Neovim server address, is written
+with mode 0600, and is refreshed when the PDF is downloaded or opened. It is
+removed on disconnect or exit when it still names this session. A viewer left
+open can therefore reach a later Neovim session after that session compiles
+the project. The callback uses the launching Neovim's `v:progpath`; if that
+executable is a temporary AppImage path that vanishes when Neovim exits,
+clicks from the older viewer stop working until it is reopened.
+Okular only handles inverse search when the source path in SyncTeX exists on
+disk, so set `sync_dir` to enable the local mirror for Okular.
 
-Set `inverse_search = false` to skip the download and the watcher.
+Okular takes the editor command only when it starts. A second `okular --unique`
+that tries to set one is refused. When `org.kde.okular` already owns its bus
+name, `:Overleaf pdf` launches without that argument; forward search never
+passes it either. An Okular started by hand or by forward search without the
+callback will not report clicks. Close that instance and use `:Overleaf pdf`.
+A source filename containing `#` breaks Okular's `pdf#src:` forward argument,
+because Okular splits the argument at `#`.
 
-Caveats are the same as forward search's: it answers for the last compile, and
-the modifier is zathura's own `synctex-edit-modifier`, ctrl by default.
+When `sync_dir` is active, the plugin rewrites project `Input:` paths in the
+downloaded SyncTeX database from `/compile/...` to the absolute mirror path.
+TeX Live paths stay intact. This gives forward search the exact path expected
+by each viewer and lets Okular open project source. Without `sync_dir`, the
+build paths stay `/compile/...`; inverse clicks still map project files back
+to their buffers. `inverse_search = false` disables listeners and callback
+arguments but keeps the database download for forward search.
 
 ## Testing status and known gaps
 
@@ -507,8 +540,28 @@ collaborators, throwaway documents deleted afterwards):
 - `suggesting` produces tracked insertions and deletions, `editing` produces plain
   edits, `viewing` sends nothing, and a change held while viewing arrives as a plain
   edit afterwards;
-- the SyncTeX lookups behind forward search, and forward search moving a real
-  zathura to the right page.
+- the older Overleaf SyncTeX lookup and zathura jump, before the viewer profiles
+  replaced them.
+
+**Checked live against real viewers, but on a local compile** (zathura, Okular
+and Evince in a private X display, driven through the plugin by a headless
+Neovim with a fake session; the PDF and SyncTeX database came from `pdflatex`
+with their paths rewritten to Overleaf's `/compile/./` layout, since the
+sandbox's login had expired):
+
+- forward search moves each viewer to the right page, for files in the root
+  and in a subfolder, with the database rewritten to the mirror and, for
+  zathura, without it;
+- a click lands on the right file and line: zathura's `Edit` and Evince's
+  `SyncSource` through the D-Bus listener, Okular's through the editor
+  command, the state file and the RPC callback;
+- PDF names and mirror paths with spaces, brackets and an apostrophe. This
+  found two bugs the unit tests had not: gdbus double-quotes a string that
+  holds an apostrophe, which the signal parsers did not read, and Evince
+  files a document under GLib's upper-case percent-escapes, which
+  `vim.uri_from_fname` does not produce;
+- with `pdf_viewer` unset and no zathura showing the PDF, forward search
+  warns instead of starting a zathura.
 
 **Checked only by unit tests and a mock server** (so only as reliable as the mock):
 
@@ -538,9 +591,10 @@ collaborators, throwaway documents deleted afterwards):
 - **Anything but the smallest case for suggestions.** Whole-word replacement was
   checked on one word. Interleaved suggestions from several people, undo history
   across a mode switch, and very large rewrites are untested.
-- **Inverse search's physical ctrl+click.** The database download, the watcher and
-  the jump from a genuine `Edit` signal are tested; a real click was not, because
-  synthetic input stopped reaching zathura's window.
+- **The viewer profiles against a real Overleaf build.** See above: the live
+  viewer checks used a local compile, so the bridge's download-and-rewrite of a
+  real `output.synctex.gz` is covered by its unit test, not end to end. The
+  sioyek example profile has not been run at all.
 - **Lint.** `luacheck` was not run for this round of changes.
 
 Treat the mode and suggestion behaviour as a first pass. If a suggestion looks

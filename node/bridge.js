@@ -272,14 +272,31 @@ const handlers = {
   },
 
   async downloadUrl(params) {
-    const { cookie, url, fileName, outputDir } = params;
+    const { cookie, url, fileName, outputDir, synctexRoot } = params;
     if (!cookie || !url) {
       throw { code: 'MISSING_PARAM', message: 'cookie and url are required' };
     }
-    const dir = downloadDir(outputDir);
-    const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || 'download'));
-    await fetchToFile(url, cookie, tmpPath);
-    return { path: tmpPath };
+    const fs = require('fs');
+    const path = require('path');
+    const destPath = path.join(downloadDir(outputDir), 'overleaf_' + (fileName || 'download'));
+    if (synctexRoot === undefined || synctexRoot === null) {
+      await fetchToFile(url, cookie, destPath);
+      return { path: destPath };
+    }
+    if (typeof synctexRoot !== 'string' || !path.isAbsolute(synctexRoot)) {
+      throw { code: 'INVALID_PARAM', message: 'synctexRoot must be an absolute path' };
+    }
+    const staging = destPath + '.' + process.pid + '.synctex-download';
+    const rewritten = destPath + '.' + process.pid + '.synctex-rewrite';
+    try {
+      await fetchToFile(url, cookie, staging);
+      fs.writeFileSync(rewritten, require('./synctex').rewrite(fs.readFileSync(staging), synctexRoot), { mode: 0o600 });
+      fs.renameSync(rewritten, destPath);
+    } finally {
+      fs.rmSync(staging, { force: true });
+      fs.rmSync(rewritten, { force: true });
+    }
+    return { path: destPath };
   },
 
   async downloadFile(params) {

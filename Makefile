@@ -17,6 +17,7 @@ test-node:
 	cd tests/node && npm install --silent 2>/dev/null
 	node tests/node/auth-cookie.test.js
 	node tests/node/integration.test.js
+	node tests/node/synctex-rewrite.test.js
 
 lint:
 	luacheck lua/ tests/ plugin/

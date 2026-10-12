@@ -9,13 +9,19 @@ local overleaf = require('overleaf')
 local OUTPUT_FILES = { { path = 'output.pdf', url = '/project/p1/output/output.pdf' } }
 
 describe('pdf viewer handoff', function()
-  local original_config, original_request, original_open
-  local pdf_path, opened
+  local original_config, original_request, original_open, original_state_path
+  local pdf_path, opened, state_dir
 
   before_each(function()
     original_config = vim.deepcopy(config._config)
     original_request = bridge.request
     original_open = vim.ui.open
+    -- Every PDF download records this Neovim's address for inverse search;
+    -- keep that out of the real per-user runtime directory.
+    original_state_path = overleaf._server_state_path
+    state_dir = vim.fn.tempname()
+    vim.fn.mkdir(state_dir, 'p')
+    overleaf._server_state_path = function() return state_dir .. '/server-state' end
 
     pdf_path = vim.fn.tempname() .. '.pdf'
     local f = assert(io.open(pdf_path, 'wb'))
@@ -44,6 +50,8 @@ describe('pdf viewer handoff', function()
     config._config = original_config
     bridge.request = original_request
     vim.ui.open = original_open
+    overleaf._server_state_path = original_state_path
+    vim.fn.delete(state_dir, 'rf')
     os.remove(pdf_path)
   end)
 

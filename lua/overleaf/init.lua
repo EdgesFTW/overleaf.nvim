@@ -9,32 +9,104 @@ local mode = require('overleaf.mode')
 
 local M = {}
 
---- Open a file with the configured viewer or platform default
+--- Address of this Neovim's RPC server, or an empty string if none is running.
+---@return string
+function M._server_address() return vim.v.servername end
+
+--- Stable, private state file name with no project text for viewer macros to expand.
+---@param pdf_path string
+---@return string
+function M._server_state_path(pdf_path)
+  return vim.fn.stdpath('run') .. '/overleaf-inverse-' .. vim.fn.sha256(pdf_path):sub(1, 16)
+end
+
+--- Build one POSIX-quoted callback command for viewers with editor hooks.
+---@param pdf_path string
+---@return string|nil
+local function callback_command(pdf_path)
+  if not config.get().inverse_search or M._server_address() == '' then return nil end
+  local source = debug.getinfo(1, 'S').source:sub(2)
+  local script = vim.fn.fnamemodify(source, ':p:h:h:h') .. '/scripts/overleaf-inverse.lua'
+  local function quote(value) return "'" .. value:gsub("'", "'\\''") .. "'" end
+  return table.concat(
+    { quote(vim.v.progpath), '--clean -l', quote(script), quote(M._server_state_path(pdf_path)) },
+    ' '
+  )
+end
+
+local function viewer_values(pdf_path, file, line, column)
+  return { pdf = pdf_path, file = file, line = line, column = column, callback = callback_command(pdf_path) }
+end
+
+--- Write the current RPC address into the user's runtime directory (mode 0600).
+---@param pdf_path string
+local function write_server_state(pdf_path)
+  if not pdf_path or M._server_address() == '' then return end
+  local statefile = M._server_state_path(pdf_path)
+  local fd, err = vim.uv.fs_open(statefile, 'w', tonumber('600', 8))
+  if not fd then
+    config.log('warn', 'Could not write inverse search state %s: %s', statefile, err)
+    return
+  end
+  local secured, mode_err = vim.uv.fs_fchmod(fd, tonumber('600', 8))
+  if not secured then
+    vim.uv.fs_close(fd)
+    os.remove(statefile)
+    config.log('warn', 'Could not secure inverse search state %s: %s', statefile, mode_err)
+    return
+  end
+  local written, write_err = vim.uv.fs_write(fd, M._server_address() .. '\n', 0)
+  vim.uv.fs_close(fd)
+  if not written then config.log('warn', 'Could not write inverse search state %s: %s', statefile, write_err) end
+end
+
+--- Remove the state only if it still belongs to this Neovim session.
+---@param pdf_path string|nil
+local function remove_server_state(pdf_path)
+  if not pdf_path or M._server_address() == '' then return end
+  local statefile = M._server_state_path(pdf_path)
+  local handle = io.open(statefile, 'r')
+  if not handle then return end
+  local server = handle:read('*l')
+  handle:close()
+  if server == M._server_address() then os.remove(statefile) end
+end
+
+M._callback_command = callback_command
+M._write_server_state = write_server_state
+M._remove_server_state = remove_server_state
+
+--- Open a file with the configured viewer or platform default.
 ---@param file_path string
 ---@return number|nil pid of the viewer, when it was started by us
 local function open_file(file_path)
-  local viewer_cmd = config.get().pdf_viewer
-  if viewer_cmd then
-    -- User-configured viewer: run as background job to avoid disrupting cursor/window layout
-    local job = vim.fn.jobstart({ viewer_cmd, file_path }, { detach = true })
-    if job > 0 then
-      local ok, pid = pcall(vim.fn.jobpid, job)
-      if ok then return pid end
-    end
-    return nil
-  else
-    -- vim.ui.open() spawns with detach=true and, for xdg-open, with the stdout
-    -- and stderr pipes disabled: the viewer is reparented to init (so it leaves
-    -- no zombie and outlives nvim) and no output is buffered for its lifetime.
-    -- It returns the process handle without waiting.
-    --
-    -- This previously used vim.fn.system(), which is synchronous and froze nvim
-    -- until the viewer exited. vim.ui.open also covers more platforms than the
-    -- mac/wsl/else detection it replaces.
-    local _, err = vim.ui.open(file_path)
-    if err then config.log('error', 'Could not open %s: %s', file_path, err) end
+  write_server_state(file_path)
+  local profile, err = viewer.profile()
+  if not profile then
+    config.log('error', '%s', err)
     return nil
   end
+  if not profile.open then
+    -- vim.ui.open() detaches the platform opener. With xdg-open its pipes are
+    -- disabled and the viewer is reparented to init, so it outlives Neovim
+    -- without leaving a zombie. vim.fn.system() would wait for the viewer and
+    -- freeze the editor until that window closed.
+    local _, open_err = vim.ui.open(file_path)
+    if open_err then config.log('error', 'Could not open %s: %s', file_path, open_err) end
+    return nil
+  end
+  -- Okular rejects a second --editor-cmd on an existing --unique instance.
+  local with_inverse = config.get().inverse_search and not viewer.unique_running(profile)
+  local argv = viewer.command(profile, 'open', viewer_values(file_path), with_inverse)
+  local job = viewer._start_job(argv, function(code, stderr)
+    if code ~= 0 then config.log('warn', 'PDF viewer exited %d: %s', code, stderr) end
+  end)
+  if job <= 0 then
+    config.log('error', 'Could not start PDF viewer: %s', argv[1])
+    return nil
+  end
+  local ok, pid = pcall(vim.fn.jobpid, job)
+  if ok then return pid end
 end
 
 M._state = {
@@ -49,9 +121,10 @@ M._state = {
   pdf_path = nil, -- where the last compile's output.pdf landed
   pdf_opened = {}, -- path -> true once a viewer has been launched for it
   pdf_pid = nil, -- viewer process, when we started it (used to find it on D-Bus)
-  build_id = nil, -- the build SyncTeX lookups address
+  build_id = nil, -- identifier of the last compile
   clsi_server_id = nil, -- CLSI node holding that build
   synctex_path = nil, -- SyncTeX database mirrored next to the PDF
+  synctex_root = nil, -- source prefix recorded in the local database
 }
 
 -- Suffixes appended to config.keymap_prefix. Kept as data so the prefix is the
@@ -76,6 +149,11 @@ local DEFAULT_KEYMAPS = {
 function M.setup(opts)
   config.setup(opts)
   M._set_keymaps()
+  local group = vim.api.nvim_create_augroup('OverleafViewerState', { clear = true })
+  vim.api.nvim_create_autocmd('VimLeavePre', {
+    group = group,
+    callback = function() remove_server_state(M._state.pdf_path) end,
+  })
 end
 
 function M._set_keymaps()
@@ -1248,18 +1326,24 @@ local function fetch_synctex_db(output_files, clsi_server_id, callback)
   local url = config.get().base_url .. db.url
   if clsi_server_id then url = url .. '?clsiserverid=' .. clsi_server_id end
 
+  -- Use the same absolute spelling for the database rewrite, forward search,
+  -- and inverse path mapping. The mirror itself may be configured relatively.
+  local synctex_root = sync.active() and vim.fs.normalize(vim.fn.fnamemodify(sync._sync_dir, ':p')):gsub('/+$', '')
+    or nil
   bridge.request('downloadUrl', {
     cookie = config.get().cookie,
     url = url,
     -- Same stem as the PDF, which is what the viewer will look for.
     fileName = (M._state.project_name or 'output') .. '.synctex.gz',
     outputDir = config.get().pdf_dir,
+    synctexRoot = synctex_root,
   }, function(err, result)
     if err then
       callback(err.message)
       return
     end
     M._state.synctex_path = result.path
+    M._state.synctex_root = synctex_root or '/compile'
     callback(nil)
   end)
 end
@@ -1292,18 +1376,20 @@ function M._open_pdf(output_files, clsi_server_id)
       config.log('error', 'PDF download failed: %s', err.message)
       return
     end
+    if M._state.pdf_path and M._state.pdf_path ~= result.path then remove_server_state(M._state.pdf_path) end
     M._state.pdf_path = result.path
+    write_server_state(result.path)
+    M._state.synctex_path = nil
+    M._state.synctex_root = nil
 
-    if config.get().inverse_search then
-      fetch_synctex_db(output_files, clsi_server_id, function(db_err)
-        if db_err then
-          config.log('debug', 'No inverse search this build: %s', db_err)
-          return
-        end
-        -- A viewer already running can start answering clicks right away.
-        vim.schedule(function() M._start_inverse_search(true) end)
-      end)
-    end
+    fetch_synctex_db(output_files, clsi_server_id, function(db_err)
+      if db_err then
+        config.log('warn', 'No SyncTeX database this build: %s', db_err)
+        return
+      end
+      -- A viewer already running can start answering clicks right away.
+      vim.schedule(function() M._start_inverse_search(true) end)
+    end)
 
     -- The file was replaced in place, so a viewer already showing it has the
     -- new build. Launching it again would only pull focus away from the
@@ -1337,6 +1423,7 @@ function M.open_pdf()
   M._state.pdf_opened[path] = true
   config.log('info', 'Opening %s', path)
   M._state.pdf_pid = open_file(path)
+  vim.defer_fn(function() M._start_inverse_search(true) end, 1500)
 end
 
 -- Everything the build compiled lives under this directory inside Overleaf's
@@ -1348,12 +1435,27 @@ local COMPILE_ROOT = '/compile/'
 ---@param input string
 ---@return string|nil nil when it is not a file of this project
 function M._synctex_source_path(input)
-  if type(input) ~= 'string' or input:sub(1, #COMPILE_ROOT) ~= COMPILE_ROOT then return nil end
-
-  local rel = input:sub(#COMPILE_ROOT + 1)
-  rel = rel:gsub('^%./', '')
-  rel = rel:gsub('/%./', '/')
-  if rel == '' then return nil end
+  if type(input) ~= 'string' then return nil end
+  if input:sub(1, 7) == 'file://' then
+    local ok, decoded = pcall(vim.uri_to_fname, input)
+    if not ok then return nil end
+    input = decoded
+  end
+  local rel
+  local mirror = M._state.synctex_root
+  if mirror and mirror ~= '/compile' and input:sub(1, #mirror + 1) == mirror .. '/' then
+    rel = input:sub(#mirror + 2)
+  elseif input:sub(1, #COMPILE_ROOT) == COMPILE_ROOT then
+    rel = input:sub(#COMPILE_ROOT + 1)
+  else
+    return nil
+  end
+  local previous
+  repeat
+    previous = rel
+    rel = rel:gsub('^%./', ''):gsub('/%./', '/')
+  until rel == previous
+  if rel == '' or rel == '..' or rel:find('../', 1, true) then return nil end
   return rel
 end
 
@@ -1409,7 +1511,7 @@ function M._on_viewer_edit(file, line, column)
     return
   end
   config.log('info', 'Inverse search: %s:%d', path, line)
-  vim.schedule(function() jump_to_source(path, line, column or 0) end)
+  vim.schedule(function() jump_to_source(path, tonumber(line) or 1, math.max(tonumber(column) or 0, 0)) end)
 end
 
 --- Start listening for clicks in the viewer, if inverse search is on and there
@@ -1417,12 +1519,23 @@ end
 ---@param quiet boolean|nil do not warn when there is no viewer yet
 function M._start_inverse_search(quiet)
   if not config.get().inverse_search then return end
-  if viewer.watching() then return end
+  local profile, profile_err = viewer.profile()
+  if not profile then
+    config.log('error', '%s', profile_err)
+    return
+  end
+  if not profile.listen then
+    viewer.stop_watching()
+    return
+  end
   if not (M._state.pdf_path and M._state.synctex_path) then return end
 
-  local ok, err = viewer.watch_edits(M._state.pdf_path, M._state.pdf_pid, M._on_viewer_edit)
-  if ok then
-    config.log('info', 'Inverse search ready: ctrl+click in the viewer')
+  -- Called again after every forward search, which may have launched a viewer;
+  -- only announce a listener that this call actually started.
+  local already = viewer.watching()
+  local ok, err = viewer.watch_edits(profile, M._state.pdf_path, M._state.pdf_pid, M._on_viewer_edit)
+  if ok and not (already and viewer.watching()) then
+    config.log('info', 'Inverse search ready in %s', profile.listen)
   elseif not quiet then
     config.log('debug', 'Inverse search not started: %s', err)
   end
@@ -1446,69 +1559,30 @@ function M.forward_search()
     config.log('warn', 'Not connected. Run :Overleaf connect first.')
     return
   end
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  local path = M._source_path(bufnr)
+  local path = M._source_path(vim.api.nvim_get_current_buf())
   if not path then
     config.log('warn', 'This buffer is not part of the Overleaf project')
     return
   end
-  if not M._state.build_id then
-    config.log('warn', 'Nothing compiled yet. Run :Overleaf compile first.')
+  if not (M._state.pdf_path and M._state.synctex_path) then
+    config.log('warn', 'No compiled PDF and SyncTeX database yet. Run :Overleaf compile first.')
     return
   end
-  if not M._state.pdf_path then
-    config.log('warn', 'No PDF to move. Run :Overleaf compile first.')
+  local profile, profile_err = viewer.profile()
+  if not profile then
+    config.log('error', '%s', profile_err)
     return
   end
-
   local cursor = vim.api.nvim_win_get_cursor(0)
-  -- Read once, up front: a disconnect between the request and its answer would
-  -- otherwise leave the callback with no PDF to move.
-  local pdf_path, pdf_pid = M._state.pdf_path, M._state.pdf_pid
-
-  bridge.request('syncCode', {
-    cookie = config.get().cookie,
-    projectId = M._state.project_id,
-    file = path,
-    line = cursor[1],
-    column = cursor[2] + 1,
-    buildId = M._state.build_id,
-    clsiServerId = M._state.clsi_server_id,
-  }, function(err, result)
-    if err then
-      config.log('error', 'Forward search failed: %s', err.message)
-      return
-    end
-
-    local hits = result and result.pdf or {}
-    if #hits == 0 then
-      -- Overleaf answers 200 with an empty list for a line that produced no
-      -- output at all, and for a file the build never read.
-      config.log('info', 'No PDF position for %s:%d', path, cursor[1])
-      return
-    end
-
-    -- Everything SyncTeX returns for one place is on one page in practice, but
-    -- only boxes on the page we jump to can be highlighted.
-    local page = hits[1].page
-    local rects = {}
-    for _, hit in ipairs(hits) do
-      if hit.page == page then
-        -- SyncTeX gives the baseline; the box grows upwards from it.
-        table.insert(rects, { hit.h, hit.v - hit.height, hit.h + hit.width, hit.v })
-      end
-    end
-
-    vim.schedule(function()
-      local ok, view_err = viewer.show(pdf_path, page, rects, pdf_pid)
-      if ok then
-        config.log('info', 'Forward search: %s:%d -> page %d', path, cursor[1], page)
-      else
-        config.log('warn', '%s', view_err)
-      end
-    end)
-  end)
+  local root = M._state.synctex_root or '/compile'
+  local values = viewer_values(M._state.pdf_path, root .. '/' .. path, cursor[1], cursor[2] + 1)
+  values.pid = M._state.pdf_pid
+  local ok, err = viewer.forward(profile, values, config.get().inverse_search)
+  if not ok then
+    config.log('warn', '%s', err)
+    return
+  end
+  vim.defer_fn(function() M._start_inverse_search(true) end, 1500)
 end
 
 function M._parse_compile_log(log_text)
@@ -1883,6 +1957,7 @@ function M.disconnect()
   bridge._on_unexpected_exit = nil
 
   -- Stop file sync watchers
+  remove_server_state(M._state.pdf_path)
   sync.stop()
 
   -- Clear collaborator cursors and comments
@@ -1909,6 +1984,7 @@ function M.disconnect()
   M._state.build_id = nil
   M._state.clsi_server_id = nil
   M._state.synctex_path = nil
+  M._state.synctex_root = nil
   viewer.stop_watching()
   mode.reset()
 

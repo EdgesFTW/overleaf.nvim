@@ -5,7 +5,7 @@ M._config = {
   cookie = nil,
   node_path = 'node',
   base_url = 'https://www.overleaf.com', -- Overleaf instance URL (for self-hosted)
-  pdf_viewer = nil, -- PDF viewer command (nil = auto-detect: 'open' on macOS, 'xdg-open' on Linux)
+  pdf_viewer = nil, -- nil = system opener; zathura/okular/evince command or a viewer profile table
   pdf_dir = nil, -- PDF output directory (nil = a private per-user dir under the system temp dir)
   -- When a compile should hand the PDF to the viewer. Every compile rewrites
   -- the same path atomically, so a viewer that reloads on change stays current
@@ -14,9 +14,9 @@ M._config = {
   --   'always' - launch it after every compile (the old behaviour)
   --   false    - never; ':Overleaf pdf' opens it on demand
   pdf_auto_open = 'once',
-  -- Ctrl+click in the PDF jumps the buffer to the line that produced it. Needs
-  -- zathura: it resolves the click against the SyncTeX database the plugin
-  -- downloads next to the PDF, then announces the result on the session bus.
+  -- Enable the viewer's inverse-search channel: D-Bus for zathura and Evince,
+  -- an editor callback for Okular or a custom profile. The SyncTeX database is
+  -- downloaded for forward search even when this is false.
   inverse_search = true,
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
   -- Files Overleaf stores as binary "fileRefs" (anything whose extension is
