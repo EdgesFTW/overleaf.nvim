@@ -1231,8 +1231,8 @@ function M.rename_entity()
 
   -- Show entries to rename
   local entries = {}
-  for _, entry in ipairs(project._project_tree) do
-    table.insert(entries, entry)
+  for _, row in ipairs(project.display_rows()) do
+    table.insert(entries, row.entry)
   end
 
   vim.ui.select(entries, {
@@ -1446,6 +1446,7 @@ function M.set_main_file(name)
       end
       M._state.root_doc_id = entry.id
       config.log('info', 'Main document set to %s', entry.path)
+      vim.schedule(function() require('overleaf.tree').refresh() end)
     end)
   end
 

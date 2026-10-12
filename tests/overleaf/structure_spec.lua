@@ -108,10 +108,18 @@ describe('project structure events', function()
     ol._registered_handlers = nil
   end)
 
+  -- Handlers defer UI work with vim.schedule; run it inline so an error in a
+  -- deferred callback fails the test instead of only printing.
   local function dispatch(name, data)
-    for _, handler in ipairs(bridge._event_handlers[name] or {}) do
-      handler(data)
-    end
+    local schedule = vim.schedule
+    vim.schedule = function(fn) fn() end
+    local ok, err = pcall(function()
+      for _, handler in ipairs(bridge._event_handlers[name] or {}) do
+        handler(data)
+      end
+    end)
+    vim.schedule = schedule
+    if not ok then error(err, 0) end
   end
 
   local function open_doc(id)

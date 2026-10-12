@@ -88,13 +88,84 @@ function M._walk_folder(folder, prefix, depth)
   end
 end
 
+-- Compare ASCII names like Overleaf's English numeric collator. Accented
+-- letters fall back to byte order rather than Unicode collation.
+local function name_less(a, b)
+  local left, right = a:lower(), b:lower()
+  local i, j = 1, 1
+  while i <= #left and j <= #right do
+    local x, y = left:sub(i, i), right:sub(j, j)
+    if x:match('%d') and y:match('%d') then
+      local xrun = left:match('^%d+', i)
+      local yrun = right:match('^%d+', j)
+      local xnum, ynum = xrun:gsub('^0+', ''), yrun:gsub('^0+', '')
+      if #xnum ~= #ynum then return #xnum < #ynum end
+      if xnum ~= ynum then return xnum < ynum end
+      if #xrun ~= #yrun then return #xrun < #yrun end
+      i, j = i + #xrun, j + #yrun
+    else
+      if x ~= y then return x < y end
+      i, j = i + 1, j + 1
+    end
+  end
+  if i <= #left or j <= #right then return i > #left end
+
+  -- Only case differs: the first differing ASCII letter prefers upper case.
+  for k = 1, math.min(#a, #b) do
+    local x, y = a:sub(k, k), b:sub(k, k)
+    if x ~= y and x:lower() == y:lower() and x:match('%a') then return x < y end
+  end
+  return a < b
+end
+
+--- Build rows from paths so newly appended entries still appear under their folder.
+--- Returns { entry = tree_entry, depth = nesting_level } in display order.
+function M.display_rows()
+  local root = { children = {} }
+  local folders = { [''] = root }
+  for _, entry in ipairs(M._project_tree) do
+    if entry.type == 'folder' then folders[entry.path] = { entry = entry, children = {} } end
+  end
+  for _, entry in ipairs(M._project_tree) do
+    local parent_path = entry.path:match('^(.*/)') or ''
+    if entry.type == 'folder' then parent_path = entry.path:sub(1, -2):match('^(.*/)') or '' end
+    local parent = folders[parent_path] or root
+    table.insert(parent.children, entry.type == 'folder' and folders[entry.path] or { entry = entry })
+  end
+
+  local rows = {}
+  local function visit(folder, depth)
+    if config.get().tree_sort ~= 'overleaf' then
+      table.sort(folder.children, function(a, b)
+        if (a.entry.type == 'folder') ~= (b.entry.type == 'folder') then return a.entry.type == 'folder' end
+        return name_less(a.entry.name, b.entry.name)
+      end)
+    end
+    for _, child in ipairs(folder.children) do
+      table.insert(rows, { entry = child.entry, depth = depth })
+      if child.children then visit(child, depth + 1) end
+    end
+  end
+  visit(root, 0)
+  return rows
+end
+
 function M.select_document(callback)
   if #M._project_tree == 0 then
     config.log('warn', 'No documents in project')
     return
   end
 
-  vim.ui.select(M._project_tree, {
+  local entries = {}
+  for _, row in ipairs(M.display_rows()) do
+    if row.entry.type ~= 'folder' then table.insert(entries, row.entry) end
+  end
+  if #entries == 0 then
+    config.log('warn', 'No documents in project')
+    return
+  end
+
+  vim.ui.select(entries, {
     prompt = 'Select Document:',
     format_item = function(item) return item.path end,
   }, function(choice)

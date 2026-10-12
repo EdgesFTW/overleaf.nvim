@@ -37,11 +37,15 @@ M._config = {
   -- aside when another plugin already claims '<leader>o' (obsidian.nvim, say).
   keymap_prefix = '<leader>o',
   keymaps = true, -- false leaves every key free; the :Overleaf commands still work
+  tree_sort = 'name', -- 'name' (natural order) or 'overleaf' (storage order)
   log_level = 'info', -- 'debug', 'info', 'warn', 'error'
 }
 
 function M.setup(opts)
   if opts then
+    if opts.tree_sort ~= nil and opts.tree_sort ~= 'name' and opts.tree_sort ~= 'overleaf' then
+      error("tree_sort must be 'name' or 'overleaf'")
+    end
     for k, v in pairs(opts) do
       M._config[k] = v
     end

@@ -7,6 +7,7 @@ M._bufnr = nil
 M._tree_winnr = nil
 M._editor_winnr = nil
 M._width = 35
+M._rows = {}
 
 --- Toggle the file tree sidebar
 function M.toggle()
@@ -80,22 +81,30 @@ function M._ensure_buffer()
 end
 
 --- Refresh the tree display
-function M.refresh()
+function M.refresh(root_doc_id)
   if not M._bufnr or not vim.api.nvim_buf_is_valid(M._bufnr) then return end
 
-  local tree = project._project_tree
+  local current_entry
+  if M._tree_winnr and vim.api.nvim_win_is_valid(M._tree_winnr) then
+    local line = vim.api.nvim_win_get_cursor(M._tree_winnr)[1]
+    current_entry = M._rows[line] and M._rows[line].entry
+  end
+  local rows = project.display_rows()
+  M._rows = rows
   local lines = {}
   local ns = vim.api.nvim_create_namespace('overleaf_tree_hl')
+  root_doc_id = root_doc_id or require('overleaf')._state.root_doc_id
 
-  for _, entry in ipairs(tree) do
-    local indent = string.rep('  ', entry.depth or 0)
+  for _, row in ipairs(rows) do
+    local entry = row.entry
+    local indent = string.rep('  ', row.depth)
     local icon, line
     if entry.type == 'folder' then
       icon = '  '
       line = indent .. icon .. entry.name .. '/'
     elseif entry.type == 'doc' then
       icon = '  '
-      line = indent .. icon .. entry.name
+      line = indent .. icon .. entry.name .. (root_doc_id and entry.id == root_doc_id and ' *' or '')
     else -- file
       icon = '  '
       line = indent .. icon .. entry.name
@@ -111,19 +120,23 @@ function M.refresh()
 
   -- Apply highlights
   vim.api.nvim_buf_clear_namespace(M._bufnr, ns, 0, -1)
-  for i, entry in ipairs(tree) do
-    if entry.type == 'folder' then vim.api.nvim_buf_add_highlight(M._bufnr, ns, 'Directory', i - 1, 0, -1) end
+  for i, row in ipairs(rows) do
+    if row.entry.type == 'folder' then vim.api.nvim_buf_add_highlight(M._bufnr, ns, 'Directory', i - 1, 0, -1) end
+  end
+  if current_entry and M._tree_winnr and vim.api.nvim_win_is_valid(M._tree_winnr) then
+    for i, row in ipairs(rows) do
+      if row.entry == current_entry or row.entry.id == current_entry.id then
+        vim.api.nvim_win_set_cursor(M._tree_winnr, { i, 0 })
+        break
+      end
+    end
   end
 end
 
 --- Handle <CR> on a tree entry
 function M._on_enter()
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
-  local tree = project._project_tree
-
-  if line_idx > #tree then return end
-
-  local entry = tree[line_idx]
+  local entry = M._rows[line_idx] and M._rows[line_idx].entry
   if not entry then return end
 
   if entry.type == 'doc' then
@@ -160,14 +173,12 @@ end
 --- Get the parent folder ID of the entry under cursor
 function M._get_parent_folder_id()
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
-  local tree = project._project_tree
-  if line_idx > #tree then return nil end
-  local entry = tree[line_idx]
+  local entry = M._rows[line_idx] and M._rows[line_idx].entry
   if not entry then return nil end
   if entry.type == 'folder' then return entry.id end
   -- For files/docs, find parent folder by path
   local parent_path = entry.path:match('^(.*/)') or ''
-  for _, e in ipairs(tree) do
+  for _, e in ipairs(project._project_tree) do
     if e.type == 'folder' and e.path == parent_path then return e.id end
   end
   return nil -- root folder
@@ -186,9 +197,7 @@ end
 function M._delete_entry()
   if not require('overleaf.mode').require_write('deleting') then return end
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
-  local tree = project._project_tree
-  if line_idx > #tree then return end
-  local entry = tree[line_idx]
+  local entry = M._rows[line_idx] and M._rows[line_idx].entry
   if not entry then return end
 
   vim.ui.input({ prompt = 'Delete "' .. entry.path .. '"? (y/N): ' }, function(answer)
@@ -223,9 +232,7 @@ end
 function M._rename_entry()
   if not require('overleaf.mode').require_write('renaming') then return end
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
-  local tree = project._project_tree
-  if line_idx > #tree then return end
-  local entry = tree[line_idx]
+  local entry = M._rows[line_idx] and M._rows[line_idx].entry
   if not entry then return end
 
   vim.ui.input({ prompt = 'Rename "' .. entry.name .. '" to: ', default = entry.name }, function(new_name)

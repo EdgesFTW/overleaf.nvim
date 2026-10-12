@@ -253,6 +253,10 @@ require('overleaf').setup({
   -- Log level: 'debug', 'info', 'warn', 'error' (default: 'info')
   log_level = 'info',
 
+  -- File tree order: 'name' (default, folders first and natural name order)
+  -- or 'overleaf' (project storage order). The main document is marked with *.
+  tree_sort = 'name',
+
   -- When a finished compile hands the PDF to the viewer. Every compile rewrites
   -- the same path atomically, so a viewer that reloads on change is already
   -- current: 'once' (default) launches it for the first compile of a session,
